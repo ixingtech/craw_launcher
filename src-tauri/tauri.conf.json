@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "小龙虾启动器",
+  "mainBinaryName": "小龙虾启动器",
+  "version": "0.1.2",
+  "identifier": "com.yipuwangc.openclawlauncher",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "小龙虾启动器",
+        "width": 1220,
+        "height": 780,
+        "minWidth": 920,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "fileAssociations": [
+      {
+        "ext": [
+          "claw"
+        ],
+        "name": "小龙虾龙虾包",
+        "description": "小龙虾启动器龙虾包",
+        "role": "Editor"
+      }
+    ],
+    "resources": [
+      "resources/acp_stream_helper.mjs",
+      "resources/gateway_subscriber.mjs"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "windows/file-associations.nsh"
+      }
+    }
+  }
+}

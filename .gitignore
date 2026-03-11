@@ -1,0 +1,17 @@
+node_modules/
+.pnpm-store/
+dist/
+src-tauri/target/
+
+*.log
+*.tmp
+.tmp-*
+tmp-*.png
+tmp-*.ico
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+.idea/
+.vscode/
