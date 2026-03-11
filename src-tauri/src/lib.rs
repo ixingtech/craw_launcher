@@ -407,7 +407,9 @@ struct OpenClawFileConfig {
 
 #[derive(Debug, Deserialize)]
 struct OpenClawFileGateway {
+    port: Option<u64>,
     auth: Option<OpenClawFileGatewayAuth>,
+    remote: Option<OpenClawFileGatewayRemote>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,6 +417,11 @@ struct OpenClawFileGatewayAuth {
     mode: Option<String>,
     token: Option<String>,
     password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenClawFileGatewayRemote {
+    url: Option<String>,
 }
 
 const SETTINGS_FILE: &str = "settings.json";
@@ -1167,12 +1174,13 @@ fn run_agent_streaming_chat(
         .map(PathBuf::from)
         .ok_or_else(|| "无法确定 OpenClaw 的启动目录。".to_string())?;
 
+    let gateway_ws_url = to_gateway_ws_url(&gateway_config.url);
     let payload = AcpStreamPayload {
         openclaw_path: executable_path.display().to_string(),
         cwd: current_dir.display().to_string(),
         profile_name: launch_target.cli_profile_name.clone(),
         session_key: String::new(),
-        gateway_url: Some(to_gateway_ws_url(&gateway_config.url)),
+        gateway_url: Some(gateway_ws_url.clone()),
         gateway_token,
         gateway_password,
         sdk_path: sdk_path.display().to_string(),
@@ -1232,7 +1240,10 @@ fn run_agent_streaming_chat(
             }
             AcpStreamEvent::Error { error } => {
                 let _ = fs::remove_file(&payload_path);
-                return Err(error);
+                return Err(format!(
+                    "{error}\nGateway URL: {}\nGateway WS URL: {}",
+                    gateway_config.url, gateway_ws_url
+                ));
             }
             AcpStreamEvent::Tool { .. } | AcpStreamEvent::ToolUpdate { .. } => {}
         }
@@ -1243,7 +1254,12 @@ fn run_agent_streaming_chat(
     let _ = fs::remove_file(&payload_path);
 
     if !status.success() && assistant_content.trim().is_empty() {
-        return Err(agent_cli_error_message("", &stderr_text));
+        return Err(format!(
+            "{}\nGateway URL: {}\nGateway WS URL: {}",
+            agent_cli_error_message("", &stderr_text),
+            gateway_config.url,
+            gateway_ws_url
+        ));
     }
     if !saw_done && assistant_content.trim().is_empty() {
         return Err(if stderr_text.trim().is_empty() {
@@ -2272,7 +2288,7 @@ fn gateway_config_for_target(
         mode: "auto".into(),
         command: Some(executable_path.display().to_string()),
         args,
-        url: gateway_url_for_port(port),
+        url: read_gateway_remote_url(profile_root).unwrap_or_else(|| gateway_url_for_port(port)),
         health_endpoint: "/health".into(),
     })
 }
@@ -3340,7 +3356,9 @@ fn apply_gateway_defaults(settings: &mut AppSettings) {
 
     let default_url = GatewayConfig::default().url;
     if settings.gateway_config.url == default_url {
-        if let Some(port) = read_gateway_port(&data_dir) {
+        if let Some(url) = read_gateway_remote_url(&data_dir) {
+            settings.gateway_config.url = url;
+        } else if let Some(port) = read_gateway_port(&data_dir) {
             settings.gateway_config.url = format!("http://127.0.0.1:{port}");
         }
     }
@@ -3348,11 +3366,34 @@ fn apply_gateway_defaults(settings: &mut AppSettings) {
 
 fn read_gateway_port(data_dir: &Path) -> Option<u64> {
     let config_path = data_dir.join("openclaw.json");
-    let value = read_json::<serde_json::Value>(&config_path).ok()?;
-    value
-        .get("gateway")
-        .and_then(|gateway| gateway.get("port"))
-        .and_then(|port| port.as_u64())
+    let config = read_json::<OpenClawFileConfig>(&config_path).ok()?;
+    config.gateway.and_then(|gateway| gateway.port)
+}
+
+fn read_gateway_remote_url(data_dir: &Path) -> Option<String> {
+    let config_path = data_dir.join("openclaw.json");
+    let config = read_json::<OpenClawFileConfig>(&config_path).ok()?;
+    let raw = config
+        .gateway?
+        .remote?
+        .url?
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(gateway_http_url_from_remote(&raw))
+}
+
+fn gateway_http_url_from_remote(url: &str) -> String {
+    if let Some(value) = url.strip_prefix("ws://") {
+        format!("http://{value}")
+    } else if let Some(value) = url.strip_prefix("wss://") {
+        format!("https://{value}")
+    } else {
+        url.to_string()
+    }
 }
 
 fn health_check(config: &GatewayConfig) -> Result<(), String> {
@@ -4082,14 +4123,11 @@ fn preview_setting_document_item(root: &Path, item_id: &str) -> Result<ProfileIt
 
 fn preview_skill_item(root: &Path, item_id: &str) -> Result<ProfileItemPreview, String> {
     let skill_name = safe_item_name(item_id)?;
-    let path = root
-        .join("workspace")
-        .join("skills")
-        .join(skill_name)
-        .join("SKILL.md");
-    if !path.is_file() {
-        return Err("没有找到要预览的技能文件.".to_string());
-    }
+    let path = skill_directory_candidates(root)
+        .into_iter()
+        .map(|skills_root| skills_root.join(skill_name).join("SKILL.md"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "没有找到要预览的技能文件.".to_string())?;
     let metadata = fs::metadata(&path).map_err(to_string_error)?;
     Ok(ProfileItemPreview {
         title: skill_name.to_string(),
@@ -4303,35 +4341,42 @@ fn collect_setting_document_items(root: &Path) -> Result<Vec<ProfileListItem>, S
     Ok(items)
 }
 
+fn skill_directory_candidates(root: &Path) -> Vec<PathBuf> {
+    vec![root.join("workspace").join("skills"), root.join("skills")]
+}
 fn collect_skill_items(root: &Path) -> Result<Vec<ProfileListItem>, String> {
-    let skills_root = root.join("workspace").join("skills");
-    if !skills_root.is_dir() {
-        return Ok(Vec::new());
-    }
-
     let mut items = Vec::new();
-    for entry in fs::read_dir(&skills_root).map_err(to_string_error)? {
-        let entry = entry.map_err(to_string_error)?;
-        let path = entry.path();
-        if !path.is_dir() {
+    let mut seen = HashSet::new();
+    for skills_root in skill_directory_candidates(root) {
+        if !skills_root.is_dir() {
             continue;
         }
-        let skill_md_path = path.join("SKILL.md");
-        if !skill_md_path.is_file() {
-            continue;
+        for entry in fs::read_dir(&skills_root).map_err(to_string_error)? {
+            let entry = entry.map_err(to_string_error)?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_md_path = path.join("SKILL.md");
+            if !skill_md_path.is_file() {
+                continue;
+            }
+            let metadata = fs::metadata(&skill_md_path).map_err(to_string_error)?;
+            let skill_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !seen.insert(skill_name.clone()) {
+                continue;
+            }
+            items.push(ProfileListItem {
+                id: skill_name.clone(),
+                title: skill_name,
+                subtitle: "Workspace Skill".into(),
+                updated_at: metadata.modified().ok().map(system_time_to_iso),
+            });
         }
-        let metadata = fs::metadata(&skill_md_path).map_err(to_string_error)?;
-        let skill_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        items.push(ProfileListItem {
-            id: skill_name.clone(),
-            title: skill_name,
-            subtitle: "Workspace Skill".into(),
-            updated_at: metadata.modified().ok().map(system_time_to_iso),
-        });
     }
     items.sort_by(|left, right| left.title.cmp(&right.title));
     Ok(items)
@@ -4598,18 +4643,28 @@ mod tests {
     fn collect_skills_reads_workspace_skill_directories() {
         let root = env::temp_dir().join(format!("openclaw-skill-dirs-test-{}", Uuid::new_v4()));
         let skills = root.join("workspace").join("skills");
+        let root_skills = root.join("skills");
         fs::create_dir_all(skills.join("alpha")).unwrap();
         fs::create_dir_all(skills.join("beta")).unwrap();
         fs::create_dir_all(skills.join("gamma")).unwrap();
+        fs::create_dir_all(root_skills.join("delta")).unwrap();
+        fs::create_dir_all(root_skills.join("alpha")).unwrap();
         fs::write(skills.join("alpha").join("SKILL.md"), "# alpha").unwrap();
         fs::write(skills.join("beta").join("README.md"), "# beta").unwrap();
         fs::write(root.join("workspace").join("AGENTS.md"), "# agents").unwrap();
         fs::write(skills.join("gamma").join("SKILL.md"), "# gamma").unwrap();
-
+        fs::write(root_skills.join("delta").join("SKILL.md"), "# delta").unwrap();
+        fs::write(root_skills.join("alpha").join("SKILL.md"), "# alpha root").unwrap();
         let items = collect_skill_items(&root).unwrap();
         let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
-        assert_eq!(ids, vec!["alpha".to_string(), "gamma".to_string()]);
-
+        assert_eq!(
+            ids,
+            vec![
+                "alpha".to_string(),
+                "delta".to_string(),
+                "gamma".to_string()
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4618,18 +4673,21 @@ mod tests {
         let root = env::temp_dir().join(format!("openclaw-preview-paths-test-{}", Uuid::new_v4()));
         let workspace = root.join("workspace");
         let skill_dir = workspace.join("skills").join("alpha");
+        let root_skill_dir = root.join("skills").join("beta");
         fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(&root_skill_dir).unwrap();
         fs::write(workspace.join("AGENTS.md"), "# agents").unwrap();
         fs::write(skill_dir.join("SKILL.md"), "# alpha").unwrap();
-
+        fs::write(root_skill_dir.join("SKILL.md"), "# beta").unwrap();
         let setting = preview_setting_document_item(&root, "AGENTS.md").unwrap();
         assert_eq!(setting.title, "AGENTS.md");
         assert!(setting.content.contains("# agents"));
-
         let skill = preview_skill_item(&root, "alpha").unwrap();
         assert_eq!(skill.title, "alpha");
         assert!(skill.content.contains("# alpha"));
-
+        let root_skill = preview_skill_item(&root, "beta").unwrap();
+        assert_eq!(root_skill.title, "beta");
+        assert!(root_skill.content.contains("# beta"));
         fs::remove_dir_all(root).unwrap();
     }
 
