@@ -45,3 +45,11 @@ Get-FileHash .\workspace\AGENTS.md -Algorithm SHA256
 ```
 
 如果文件大小或 SHA-256 不一致，说明龙虾包内容已经被改动。
+## macOS
+
+See [docs/macos-build.md](docs/macos-build.md) for:
+
+- default OpenClaw paths on macOS
+- `.app` vs CLI executable selection
+- macOS bundle commands: `pnpm build:mac`, `pnpm build:mac-app`, `pnpm build:mac-dmg`
+- signing and notarization notes

@@ -1,0 +1,34 @@
+{
+  "build": {
+    "beforeBuildCommand": "node tools/set-build-locale.mjs en-US && pnpm build"
+  },
+  "productName": "Craw Launcher",
+  "mainBinaryName": "Craw Launcher",
+  "app": {
+    "windows": [
+      {
+        "title": "Craw Launcher"
+      }
+    ]
+  },
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": [
+          "claw"
+        ],
+        "name": "Craw Package",
+        "description": "Craw Launcher package",
+        "role": "Editor"
+      }
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "English"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

@@ -94,6 +94,7 @@ export interface ProfileItemPreview {
 }
 
 export interface ProfileInventory {
+  settingDocuments: ProfileListItem[];
   skills: ProfileListItem[];
   cronJobs: ProfileListItem[];
   memories: ProfileListItem[];

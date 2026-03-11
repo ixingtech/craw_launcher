@@ -6,7 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:nsis": "tauri build --bundles nsis --no-sign && node tools/rename-nsis-artifact.mjs",
+    "build:mac": "tauri bundle --bundles app,dmg",
+    "build:mac-app": "tauri bundle --bundles app",
+    "build:mac-dmg": "tauri bundle --bundles dmg",
+    "build:nsis": "pnpm build:nsis:zh-CN && pnpm build:nsis:en-US",
+    "build:nsis:zh-CN": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.zh-CN.conf.json && node tools/rename-nsis-artifact.mjs zh-CN",
+    "build:nsis:en-US": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.en-US.conf.json && node tools/rename-nsis-artifact.mjs en-US",
     "preview": "vite preview",
     "tauri": "tauri"
   },

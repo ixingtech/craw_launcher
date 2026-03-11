@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-  openclaw_launcher_lib::run();
+    openclaw_launcher_lib::run();
 }

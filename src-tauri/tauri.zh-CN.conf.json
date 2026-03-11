@@ -1,0 +1,37 @@
+{
+  "build": {
+    "beforeBuildCommand": "node tools/set-build-locale.mjs zh-CN && pnpm build"
+  },
+  "productName": "小龙虾启动器",
+  "mainBinaryName": "小龙虾启动器",
+  "app": {
+    "windows": [
+      {
+        "title": "小龙虾启动器"
+      }
+    ]
+  },
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": [
+          "claw"
+        ],
+        "name": "小龙虾包",
+        "description": "小龙虾启动器安装包",
+        "role": "Editor"
+      }
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese"
+        ],
+        "customLanguageFiles": {
+          "SimpChinese": "windows/SimpChinese.nsh"
+        },
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

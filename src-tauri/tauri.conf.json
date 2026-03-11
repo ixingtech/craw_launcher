@@ -7,8 +7,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeDevCommand": "node tools/set-build-locale.mjs zh-CN && pnpm dev",
+    "beforeBuildCommand": "node tools/set-build-locale.mjs zh-CN && pnpm build"
   },
   "app": {
     "windows": [
@@ -16,7 +16,7 @@
         "title": "小龙虾启动器",
         "width": 1220,
         "height": 780,
-        "minWidth": 920,
+        "minWidth": 1040,
         "minHeight": 620
       }
     ],
@@ -32,8 +32,8 @@
         "ext": [
           "claw"
         ],
-        "name": "小龙虾龙虾包",
-        "description": "小龙虾启动器龙虾包",
+        "name": "小龙虾包",
+        "description": "小龙虾启动器安装包",
         "role": "Editor"
       }
     ],
@@ -42,13 +42,22 @@
       "resources/gateway_subscriber.mjs"
     ],
     "icon": [
+      "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
     ],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "installerHooks": "windows/file-associations.nsh"
+        "installerHooks": "windows/file-associations.nsh",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "customLanguageFiles": {
+          "SimpChinese": "windows/SimpChinese.nsh"
+        },
+        "displayLanguageSelector": true
       }
     }
   }
