@@ -310,6 +310,7 @@ struct AcpStreamPayload {
     openclaw_path: String,
     cwd: String,
     profile_name: Option<String>,
+    state_dir: Option<String>,
     session_key: String,
     gateway_url: Option<String>,
     gateway_token: Option<String>,
@@ -1074,7 +1075,7 @@ fn run_chat_request(
                     }
                     Ok(content)
                 }
-                Err(fallback_error) => Err(format!("{stream_error}\n{fallback_error}")),
+                Err(fallback_error) => Err(merge_chat_errors(&stream_error, &fallback_error)),
             }
         })?;
 
@@ -1164,6 +1165,7 @@ fn run_agent_streaming_chat(
         .or_else(|| settings.recent_profile_id.clone())
         .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
+    validate_chat_runtime_for_target(&launch_target)?;
     let runtime_state = app.state::<RuntimeState>();
     let gateway_config =
         ensure_target_gateway_running(&runtime_state, &executable_path, &launch_target)?;
@@ -1179,6 +1181,9 @@ fn run_agent_streaming_chat(
         openclaw_path: executable_path.display().to_string(),
         cwd: current_dir.display().to_string(),
         profile_name: launch_target.cli_profile_name.clone(),
+        state_dir: launch_target
+            .use_state_dir_env
+            .then(|| launch_target.profile_path.clone()),
         session_key: String::new(),
         gateway_url: Some(gateway_ws_url.clone()),
         gateway_token,
@@ -1295,6 +1300,7 @@ fn run_agent_cli_chat(
         .or_else(|| settings.recent_profile_id.clone())
         .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
+    validate_chat_runtime_for_target(&launch_target)?;
     let runtime_state = app.state::<RuntimeState>();
     let gateway_config =
         ensure_target_gateway_running(&runtime_state, &executable_path, &launch_target)?;
@@ -2249,7 +2255,8 @@ fn gateway_url_for_port(port: u64) -> String {
 }
 
 fn control_web_url(gateway_config: &GatewayConfig, profile_path: &str) -> String {
-    let mut url = gateway_config.url.trim_end_matches('/').to_string();
+    let mut url = read_gateway_remote_url(Path::new(profile_path))
+        .unwrap_or_else(|| gateway_config.url.trim_end_matches('/').to_string());
     if let Some(token) = read_profile_gateway_secret(profile_path, "token") {
         url.push_str("/#token=");
         url.push_str(&token);
@@ -2288,7 +2295,7 @@ fn gateway_config_for_target(
         mode: "auto".into(),
         command: Some(executable_path.display().to_string()),
         args,
-        url: read_gateway_remote_url(profile_root).unwrap_or_else(|| gateway_url_for_port(port)),
+        url: gateway_url_for_port(port),
         health_endpoint: "/health".into(),
     })
 }
@@ -2399,6 +2406,23 @@ fn apply_gateway_env(command: &mut Command, gateway_config: &GatewayConfig, prof
     }
 }
 
+fn validate_chat_runtime_for_target(launch_target: &LaunchTarget) -> Result<(), String> {
+    let auth_path = Path::new(&launch_target.profile_path)
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("auth-profiles.json");
+    if auth_path.is_file() {
+        return Ok(());
+    }
+
+    Err(if launch_target.profile_id == LOCAL_PROFILE_ID {
+        "当前龙虾缺少账号认证信息，无法聊天。请先在当前电脑完成 OpenClaw 配置。".to_string()
+    } else {
+        "这只导入的龙虾缺少账号认证信息，无法直接聊天。默认导出不会包含 auth-profiles.json，请在当前电脑先完成 OpenClaw 配置，或重新导出包含账号信息的龙虾包。".to_string()
+    })
+}
+
 fn read_gateway_auth_secret(data_dir: &Path) -> Option<(String, String)> {
     let config_path = data_dir.join("openclaw.json");
     let config = read_json::<OpenClawFileConfig>(&config_path).ok()?;
@@ -2445,6 +2469,25 @@ fn to_gateway_ws_url(url: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn normalize_chat_error_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn merge_chat_errors(primary: &str, fallback: &str) -> String {
+    let mut lines = normalize_chat_error_lines(primary);
+    for line in normalize_chat_error_lines(fallback) {
+        if !lines.iter().any(|existing| existing == &line) {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
 }
 
 fn acp_session_key(profile_id: &str, conversation_id: &str) -> String {
@@ -4585,12 +4628,13 @@ fn localize_preview_json_times(value: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::{
         apply_gateway_defaults, cli_profile_name_for, collect_cron_items,
-        collect_setting_document_items, collect_skill_items, export_profile_impl,
-        extract_agent_cli_text, infer_data_dir, is_valid_cli_profile_name,
-        is_valid_openclaw_command_path, localize_preview_json_times, looks_like_openclaw_data_dir,
-        normalize_managed_profile_runtime, preview_cron_item, preview_setting_document_item,
-        preview_skill_item, read_json, schedule_summary_from_value, should_skip_export_path,
-        verify_import_package_impl, AppSettings, ExportProfileRequest,
+        collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
+        extract_agent_cli_text, gateway_config_for_target, infer_data_dir,
+        is_valid_cli_profile_name, is_valid_openclaw_command_path, localize_preview_json_times,
+        looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
+        preview_cron_item, preview_setting_document_item, preview_skill_item, read_json,
+        schedule_summary_from_value, should_skip_export_path, validate_chat_runtime_for_target,
+        verify_import_package_impl, AppSettings, ExportProfileRequest, GatewayConfig, LaunchTarget,
     };
     use std::{env, fs, fs::File};
     use uuid::Uuid;
@@ -5077,6 +5121,124 @@ mod tests {
         assert!(!is_valid_openclaw_command_path(&gateway_path));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn control_web_url_prefers_profile_remote_url() {
+        let root = env::temp_dir().join(format!("openclaw-control-url-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("openclaw.json"),
+            serde_json::json!({
+                "gateway": {
+                    "port": 18789,
+                    "auth": {
+                        "mode": "token",
+                        "token": "test-token"
+                    },
+                    "remote": {
+                        "url": "ws://gateway.example.com/runtime"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let url = control_web_url(
+            &GatewayConfig {
+                mode: "auto".into(),
+                command: None,
+                args: Vec::new(),
+                url: "http://127.0.0.1:18789".into(),
+                health_endpoint: "/health".into(),
+            },
+            &root.display().to_string(),
+        );
+
+        assert_eq!(url, "http://gateway.example.com/runtime/#token=test-token");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gateway_runtime_uses_local_port_even_if_remote_url_exists() {
+        let root =
+            env::temp_dir().join(format!("openclaw-gateway-runtime-test-{}", Uuid::new_v4()));
+        let executable = root.join(if cfg!(target_os = "windows") {
+            "openclaw.exe"
+        } else {
+            "openclaw"
+        });
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&executable, b"").unwrap();
+        fs::write(
+            root.join("openclaw.json"),
+            serde_json::json!({
+                "gateway": {
+                    "port": 18789,
+                    "auth": {
+                        "mode": "token",
+                        "token": "test-token"
+                    },
+                    "remote": {
+                        "url": "ws://gateway.example.com/runtime"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = gateway_config_for_target(
+            &executable,
+            &LaunchTarget {
+                profile_id: "__local__".into(),
+                profile_name: "Local".into(),
+                profile_path: root.display().to_string(),
+                cli_profile_name: None,
+                use_state_dir_env: false,
+                managed_profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.url, "http://127.0.0.1:18789");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_chat_runtime_reports_missing_auth_for_imported_profile() {
+        let root = env::temp_dir().join(format!("openclaw-chat-auth-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("workspace")).unwrap();
+
+        let error = validate_chat_runtime_for_target(&LaunchTarget {
+            profile_id: "managed-profile-id".into(),
+            profile_name: "Imported".into(),
+            profile_path: root.display().to_string(),
+            cli_profile_name: Some("profile-managed".into()),
+            use_state_dir_env: false,
+            managed_profile: None,
+        })
+        .unwrap_err();
+
+        assert!(error.contains("auth-profiles.json"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_chat_errors_deduplicates_identical_lines() {
+        let merged = merge_chat_errors(
+            "这只龙虾自己的连接服务没有启动成功。\nGateway URL: http://127.0.0.1:18789",
+            "这只龙虾自己的连接服务没有启动成功。\nGateway URL: http://127.0.0.1:18789",
+        );
+
+        assert_eq!(
+            merged,
+            "这只龙虾自己的连接服务没有启动成功。\nGateway URL: http://127.0.0.1:18789"
+        );
     }
 
     #[cfg(target_os = "macos")]
