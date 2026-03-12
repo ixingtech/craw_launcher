@@ -12,6 +12,8 @@
     "build:nsis": "pnpm build:nsis:zh-CN && pnpm build:nsis:en-US",
     "build:nsis:zh-CN": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.zh-CN.conf.json && node tools/rename-nsis-artifact.mjs zh-CN",
     "build:nsis:en-US": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.en-US.conf.json && node tools/rename-nsis-artifact.mjs en-US",
+    "build:cli": "cargo build --manifest-path src-tauri/Cargo.toml --bin claws-cli --release",
+    "build:cli:archive": "pnpm build:cli && node tools/package-cli.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
