@@ -67,7 +67,7 @@
       "endpoints": [
         "https://github.com/yipuwangc/claws_launcher/releases/latest/download/latest-zh-CN.json"
       ],
-      "pubkey": ""
+      "pubkey": "untrusted comment: minisign public key: ED32FA91C0DF77CB\nRWTLd9/Akfoy7XWZVcf46tN1QdKvGjG3j55MFmseEuu6xlubv92cQwSs"
     }
   }
 }
