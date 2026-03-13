@@ -9,7 +9,7 @@ if (!locale) {
 
 const bundleDir = path.resolve("src-tauri", "target", "release", "bundle", "nsis");
 const releaseDir = path.resolve("src-tauri", "target", "release");
-const VERSION = "0.1.4";
+const VERSION = "0.1.5";
 
 const artifactConfig = {
   "zh-CN": {

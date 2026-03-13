@@ -35,6 +35,12 @@ const DEFAULT_EXECUTABLE_PATH = IS_MAC
 
 type StatusTone = "success" | "warning" | "error";
 
+type UpdateState =
+  | { kind: "idle" }
+  | { kind: "latest" }
+  | { kind: "available"; version: string; notes?: string | null }
+  | { kind: "unavailable" };
+
 type ExportState = {
   open: boolean;
   sourceDir: string;
@@ -98,7 +104,7 @@ export default function App() {
   const [lobsterSearch, setLobsterSearch] = useState("");
   const [status, setStatus] = useState<{ message: string; tone: StatusTone } | null>(null);
   const [currentVersion, setCurrentVersion] = useState("");
-  const [updateSummary, setUpdateSummary] = useState<{ version: string; notes?: string | null } | null>(null);
+  const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [docDraft, setDocDraft] = useState("");
@@ -242,11 +248,15 @@ export default function App() {
     let cancelled = false;
     void check()
       .then((update) => {
-        if (cancelled || !update) return;
-        setUpdateSummary({ version: update.version, notes: update.body });
+        if (cancelled) return;
+        if (!update) {
+          setUpdateState({ kind: "latest" });
+          return;
+        }
+        setUpdateState({ kind: "available", version: update.version, notes: update.body });
       })
       .catch(() => {
-        if (!cancelled) setUpdateSummary(null);
+        if (!cancelled) setUpdateState({ kind: "unavailable" });
       });
     return () => {
       cancelled = true;
@@ -539,13 +549,14 @@ export default function App() {
     try {
       const update = await check();
       if (!update) {
-        setUpdateSummary(null);
+        setUpdateState({ kind: "latest" });
         setStatus({ message: t("noUpdateAvailable"), tone: "success" });
         return;
       }
-      setUpdateSummary({ version: update.version, notes: update.body });
+      setUpdateState({ kind: "available", version: update.version, notes: update.body });
       setStatus({ message: t("updateAvailableStatus", { version: update.version }), tone: "success" });
     } catch (error) {
+      setUpdateState({ kind: "unavailable" });
       setStatus({ message: readableError(error, t("checkUpdatesFailed")), tone: "error" });
     } finally {
       setCheckingUpdates(false);
@@ -557,14 +568,16 @@ export default function App() {
     try {
       const update = await check();
       if (!update) {
-        setUpdateSummary(null);
+        setUpdateState({ kind: "latest" });
         setStatus({ message: t("noUpdateAvailable"), tone: "success" });
         return;
       }
+      setUpdateState({ kind: "available", version: update.version, notes: update.body });
       await update.downloadAndInstall();
       setStatus({ message: t("updaterRestarting"), tone: "success" });
       await relaunch();
     } catch (error) {
+      setUpdateState({ kind: "unavailable" });
       setStatus({ message: readableError(error, t("installUpdateFailed")), tone: "error" });
     } finally {
       setInstallingUpdate(false);
@@ -749,7 +762,7 @@ export default function App() {
                 <div className="hero-note"><div className="hero-note-row"><span>{t("lastLaunch")}</span><strong>{activeLaunchRecord ? formatTime(activeLaunchRecord.launchedAt) : recentLaunch ? formatTime(recentLaunch.launchedAt) : t("noLaunchRecordYet")}</strong></div></div>
               </div>
             </section>
-            <div className="build-signature">2026/3/13 0.1.4 @ixing</div>
+            <div className="build-signature">2026/3/14 0.1.5 @ixing</div>
           </section>
         ) : null}
         {store.page === "profiles" ? (
@@ -992,18 +1005,18 @@ export default function App() {
                 </button>
               </div>
               <div className="candidate-card">
-                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.4"} />
-                {updateSummary ? (
+                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.5"} />
+                {updateState.kind === "available" ? (
                   <>
-                    <DetailRow label={t("checkForUpdates")} value={updateSummary.version} />
-                    {updateSummary.notes ? <div className="detail-row"><span>{t("releaseNotesLabel")}</span><span>{updateSummary.notes}</span></div> : null}
+                    <DetailRow label={t("checkForUpdates")} value={updateState.version} />
+                    {updateState.notes ? <div className="detail-row"><span>{t("releaseNotesLabel")}</span><span>{updateState.notes}</span></div> : null}
                     <div className="button-row wrap">
                       <button className="button primary" onClick={() => void onInstallUpdate()} disabled={checkingUpdates || installingUpdate}>
                         {installingUpdate ? t("installingUpdate") : t("installUpdate")}
                       </button>
                     </div>
                   </>
-                ) : <p className="muted">{t("updaterUnavailable")}</p>}
+                ) : updateState.kind === "latest" ? <p className="muted">{t("noUpdateAvailable")}</p> : updateState.kind === "unavailable" ? <p className="muted">{t("updaterUnavailable")}</p> : <p className="muted">{t("checkingForUpdates")}</p>}
               </div>
             </section>
             <details className="panel advanced-panel" open={advancedOpen} onToggle={(event) => setAdvancedOpen((event.currentTarget as HTMLDetailsElement).open)}>
