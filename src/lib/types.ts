@@ -19,7 +19,16 @@ export interface PathCandidate {
   dataDir?: string | null;
   source: string;
   score: number;
+  runtimeKind: "windows" | "wsl";
+  wslDistro?: string | null;
   validation: ValidationResult;
+}
+
+export interface RuntimeTargetConfig {
+  kind: "windows" | "wsl";
+  wslDistro?: string | null;
+  wslOpenclawPath?: string | null;
+  wslDataDir?: string | null;
 }
 
 export interface LaunchRecord {
@@ -39,6 +48,7 @@ export interface GatewayConfig {
 export interface AppSettings {
   openclawExecutablePath?: string | null;
   openclawDataDir?: string | null;
+  runtimeTarget: RuntimeTargetConfig;
   profilesRoot?: string | null;
   gatewayConfig: GatewayConfig;
   recentProfileId?: string | null;
