@@ -1,4 +1,4 @@
-﻿import fs from "node:fs";
+import fs from "node:fs";
 import path from "node:path";
 
 const locale = process.argv[2];
@@ -13,11 +13,14 @@ const VERSION = "0.1.4";
 
 const artifactConfig = {
   "zh-CN": {
-    sourceName: `小龙虾启动器_${VERSION}_x64-setup.exe`,
-    targetName: `小龙虾启动器_${VERSION}_windows_x64.exe`,
+    sourceName: `xiaolongxia_${VERSION}_x64-setup.exe`,
+    targetName: `xiaolongxia_${VERSION}_windows_x64.exe`,
     legacyNames: [
       `openclaw-launcher_${VERSION}_windows_x64_zh-CN.exe`,
-      `小龙虾启动器_${VERSION}_x64安装包.exe`
+      `xiaolongxia_${VERSION}_installer.exe`,
+      `小龙虾启动器_${VERSION}_x64安装包.exe`,
+      `小龙虾启动器_${VERSION}_x64-setup.exe`,
+      `小龙虾启动器_${VERSION}_windows_x64.exe`
     ]
   },
   "en-US": {

@@ -12,7 +12,7 @@ const sourceName = "openclaw_launcher.exe";
 const sourcePath = path.join(releaseDir, sourceName);
 
 const targetNameByLocale = {
-  "zh-CN": "小龙虾启动器.exe",
+  "zh-CN": "xiaolongxia.exe",
   "en-US": "Craw Launcher.exe"
 };
 

@@ -11,13 +11,13 @@ const releaseDir = path.resolve("src-tauri", "target", "release");
 const bundleDir = path.resolve("src-tauri", "target", "release", "bundle", "nsis");
 const assetName =
   locale === "zh-CN"
-    ? `\u5c0f\u9f99\u867e\u542f\u52a8\u5668_${version}_windows_x64.exe`
+    ? `xiaolongxia_${version}_windows_x64.exe`
     : `craw-launcher_${version}_windows_x64.exe`;
 const sigName = `${assetName}.sig`;
 const manifestName = locale === "zh-CN" ? "latest-zh-CN.json" : "latest-en-US.json";
 const notes =
   locale === "zh-CN"
-    ? `\u5c0f\u9f99\u867e\u542f\u52a8\u5668 ${version} \u5df2\u53d1\u5e03\u3002`
+    ? `xiaolongxia ${version} is now available.`
     : `Craw Launcher ${version} is now available.`;
 
 const sigPath = path.join(releaseDir, sigName);

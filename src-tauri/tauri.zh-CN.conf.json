@@ -2,12 +2,12 @@
   "build": {
     "beforeBuildCommand": "node tools/set-build-locale.mjs zh-CN && pnpm build"
   },
-  "productName": "小龙虾启动器",
+  "productName": "xiaolongxia",
   "mainBinaryName": "openclaw_launcher",
   "app": {
     "windows": [
       {
-        "title": "小龙虾启动器"
+        "title": "xiaolongxia"
       }
     ]
   },
@@ -17,8 +17,8 @@
         "ext": [
           "claw"
         ],
-        "name": "小龙虾包",
-        "description": "小龙虾启动器安装包",
+        "name": "xiaolongxia package",
+        "description": "xiaolongxia launcher package",
         "role": "Editor"
       }
     ],
