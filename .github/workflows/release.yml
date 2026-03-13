@@ -63,8 +63,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/小龙虾启动器.exe
-            src-tauri/target/release/Craw Launcher.exe
             src-tauri/target/release/小龙虾启动器_*.exe
             src-tauri/target/release/小龙虾启动器_*.exe.sig
             src-tauri/target/release/craw-launcher_*.exe
