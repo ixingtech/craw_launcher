@@ -39,6 +39,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build frontend assets
+        run: pnpm build
+
       - name: Build standalone CLI binary
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin claws-cli --features standalone-cli --release
 
