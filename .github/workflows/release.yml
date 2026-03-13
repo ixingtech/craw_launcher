@@ -13,6 +13,7 @@ jobs:
     runs-on: windows-latest
     env:
       REPOSITORY: ${{ github.repository }}
+      UPDATER_REPOSITORY: yipuwangc/claws-launcher-releases
       TAG_NAME: ${{ github.ref_name }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -56,8 +57,8 @@ jobs:
         run: |
           VERSION_NO_V="${TAG_NAME#v}"
           PUB_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          node tools/generate-updater-manifest.mjs zh-CN "$VERSION_NO_V" "$TAG_NAME" "$REPOSITORY" "$PUB_DATE"
-          node tools/generate-updater-manifest.mjs en-US "$VERSION_NO_V" "$TAG_NAME" "$REPOSITORY" "$PUB_DATE"
+          node tools/generate-updater-manifest.mjs zh-CN "$VERSION_NO_V" "$TAG_NAME" "$UPDATER_REPOSITORY" "$PUB_DATE"
+          node tools/generate-updater-manifest.mjs en-US "$VERSION_NO_V" "$TAG_NAME" "$UPDATER_REPOSITORY" "$PUB_DATE"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
