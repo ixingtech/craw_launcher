@@ -28,6 +28,10 @@ fn is_english_build() -> bool {
     build_locale::BUILD_LOCALE == "en-US"
 }
 
+fn updater_pubkey() -> &'static str {
+    include_str!("../updater-public-key.pub").trim()
+}
+
 #[derive(Default)]
 struct RuntimeState {
     gateway: Mutex<GatewayRuntime>,
@@ -495,6 +499,12 @@ fn desktop_path() -> Option<String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updater_pubkey())
+                .build(),
+        )
         .manage(RuntimeState::default())
         .setup(|app| {
             if let Ok(settings) = load_settings(app.handle().clone()) {
