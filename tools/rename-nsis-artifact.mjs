@@ -1,4 +1,4 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import path from "node:path";
 
 const locale = process.argv[2];
@@ -9,21 +9,22 @@ if (!locale) {
 
 const bundleDir = path.resolve("src-tauri", "target", "release", "bundle", "nsis");
 const releaseDir = path.resolve("src-tauri", "target", "release");
+const VERSION = "0.1.3";
 
 const artifactConfig = {
   "zh-CN": {
-    sourceName: "小龙虾启动器_0.1.2_x64-setup.exe",
-    targetName: "小龙虾启动器_0.1.2_windows_x64.exe",
+    sourceName: `小龙虾启动器_${VERSION}_x64-setup.exe`,
+    targetName: `小龙虾启动器_${VERSION}_windows_x64.exe`,
     legacyNames: [
-      "openclaw-launcher_0.1.2_windows_x64_zh-CN.exe",
-      "小龙虾启动器_0.1.2_x64安装包.exe",
-    ],
+      `openclaw-launcher_${VERSION}_windows_x64_zh-CN.exe`,
+      `小龙虾启动器_${VERSION}_x64安装包.exe`
+    ]
   },
   "en-US": {
-    sourceName: "Craw Launcher_0.1.2_x64-setup.exe",
-    targetName: "craw-launcher_0.1.2_windows_x64.exe",
-    legacyNames: ["openclaw-launcher_0.1.2_windows_x64_en-US.exe"],
-  },
+    sourceName: `Craw Launcher_${VERSION}_x64-setup.exe`,
+    targetName: `craw-launcher_${VERSION}_windows_x64.exe`,
+    legacyNames: [`openclaw-launcher_${VERSION}_windows_x64_en-US.exe`]
+  }
 };
 
 const config = artifactConfig[locale];
@@ -35,12 +36,15 @@ if (!config) {
 const sourcePath = path.join(bundleDir, config.sourceName);
 const bundleTargetPath = path.join(bundleDir, config.targetName);
 const releaseTargetPath = path.join(releaseDir, config.targetName);
+const sourceSigPath = `${sourcePath}.sig`;
+const bundleSigTargetPath = `${bundleTargetPath}.sig`;
+const releaseSigTargetPath = `${releaseTargetPath}.sig`;
 
 if (!fs.existsSync(sourcePath)) {
   throw new Error(`missing NSIS artifact: ${sourcePath}`);
 }
 
-for (const targetPath of [bundleTargetPath, releaseTargetPath]) {
+for (const targetPath of [bundleTargetPath, releaseTargetPath, bundleSigTargetPath, releaseSigTargetPath]) {
   if (fs.existsSync(targetPath)) {
     fs.rmSync(targetPath, { force: true });
   }
@@ -52,10 +56,18 @@ for (const legacyName of config.legacyNames) {
     if (legacyPath !== sourcePath && fs.existsSync(legacyPath)) {
       fs.rmSync(legacyPath, { force: true });
     }
+    const legacySigPath = `${legacyPath}.sig`;
+    if (legacySigPath !== sourceSigPath && fs.existsSync(legacySigPath)) {
+      fs.rmSync(legacySigPath, { force: true });
+    }
   }
 }
 
 fs.renameSync(sourcePath, bundleTargetPath);
 fs.copyFileSync(bundleTargetPath, releaseTargetPath);
+if (fs.existsSync(sourceSigPath)) {
+  fs.renameSync(sourceSigPath, bundleSigTargetPath);
+  fs.copyFileSync(bundleSigTargetPath, releaseSigTargetPath);
+}
 
 console.log(`finalized installer ${config.targetName}`);

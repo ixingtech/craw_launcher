@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "小龙虾启动器",
+  "productName": "灏忛緳铏惧惎鍔ㄥ櫒",
   "mainBinaryName": "openclaw_launcher",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "identifier": "com.yipuwangc.openclawlauncher",
   "build": {
     "frontendDist": "../dist",
@@ -13,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "小龙虾启动器",
+        "title": "灏忛緳铏惧惎鍔ㄥ櫒",
         "width": 1220,
         "height": 780,
         "minWidth": 1040,
@@ -32,8 +32,8 @@
         "ext": [
           "claw"
         ],
-        "name": "小龙虾包",
-        "description": "小龙虾启动器安装包",
+        "name": "灏忛緳铏惧寘",
+        "description": "灏忛緳铏惧惎鍔ㄥ櫒瀹夎鍖?,",
         "role": "Editor"
       }
     ],
@@ -59,6 +59,14 @@
         },
         "displayLanguageSelector": true
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/yipuwangc/claws_launcher/releases/latest/download/latest-zh-CN.json"
+      ],
+      "pubkey": ""
     }
   }
 }

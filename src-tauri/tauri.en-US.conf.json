@@ -30,5 +30,12 @@
         "displayLanguageSelector": false
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/yipuwangc/claws_launcher/releases/latest/download/latest-en-US.json"
+      ]
+    }
   }
 }

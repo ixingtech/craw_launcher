@@ -46,6 +46,7 @@ async function main() {
   const serverArgs = buildServerArgs(payload);
   const env = {
     ...process.env,
+    ...(payload.stateDir ? { OPENCLAW_STATE_DIR: payload.stateDir } : {}),
     ...(payload.gatewayUrl ? { OPENCLAW_GATEWAY_URL: payload.gatewayUrl } : {}),
     ...(payload.gatewayToken ? { OPENCLAW_GATEWAY_TOKEN: payload.gatewayToken } : {}),
     ...(payload.gatewayPassword ? { OPENCLAW_GATEWAY_PASSWORD: payload.gatewayPassword } : {}),

@@ -1,5 +1,8 @@
 ﻿import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import lobsterIcon from "./icon.svg";
@@ -66,6 +69,12 @@ type InventorySection = "settingDocuments" | "skills" | "cronJobs" | "memories" 
 const defaultSettings: AppSettings = {
   openclawExecutablePath: "",
   openclawDataDir: "",
+  runtimeTarget: {
+    kind: "windows",
+    wslDistro: "",
+    wslOpenclawPath: "",
+    wslDataDir: ""
+  },
   profilesRoot: "",
   gatewayConfig: {
     mode: "manual",
@@ -87,6 +96,10 @@ export default function App() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [lobsterSearch, setLobsterSearch] = useState("");
   const [status, setStatus] = useState<{ message: string; tone: StatusTone } | null>(null);
+  const [currentVersion, setCurrentVersion] = useState("");
+  const [updateSummary, setUpdateSummary] = useState<{ version: string; notes?: string | null } | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
   const [docDraft, setDocDraft] = useState("");
   const [docEditing, setDocEditing] = useState(false);
   const [previewState, setPreviewState] = useState<PreviewState>({
@@ -174,6 +187,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void getVersion().then(setCurrentVersion).catch(() => setCurrentVersion(""));
+  }, []);
+
+  useEffect(() => {
     if (!docEditing) {
       setDocDraft(readmeQuery.data?.content || "");
     }
@@ -182,6 +199,21 @@ export default function App() {
   useEffect(() => {
     if (settingsQuery.data) setSettingsDraft(settingsQuery.data);
   }, [settingsQuery.data]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void check()
+      .then((update) => {
+        if (cancelled || !update) return;
+        setUpdateSummary({ version: update.version, notes: update.body });
+      })
+      .catch(() => {
+        if (!cancelled) setUpdateSummary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!store.activeProfileId) store.setActiveProfileId(settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID);
@@ -259,6 +291,7 @@ export default function App() {
     queryKey: ["notifications", activeLobsterId],
     queryFn: () => api.listNotifications(activeLobsterId),
     enabled: store.page === "notifications",
+    refetchInterval: store.page === "notifications" ? 5000 : false,
     refetchOnWindowFocus: false,
     staleTime: 15000
   });
@@ -308,7 +341,9 @@ export default function App() {
     }
   }, [chatConversations, selectedConversationSummary, sortedChatConversations, store]);
   const waitingForReply = store.selectedConversationId ? !!store.waitingConversations[store.selectedConversationId] : false;
-  const needsSetup = !settingsDraft.openclawExecutablePath || !settingsDraft.openclawDataDir;
+  const needsSetup = settingsDraft.runtimeTarget.kind === "wsl"
+    ? !settingsDraft.runtimeTarget.wslDistro || !settingsDraft.runtimeTarget.wslOpenclawPath || !settingsDraft.runtimeTarget.wslDataDir
+    : !settingsDraft.openclawExecutablePath || !settingsDraft.openclawDataDir;
   const recentLaunch = settingsQuery.data?.recentLaunches?.[0];
 
   const saveSettingsMutation = useMutation({
@@ -438,9 +473,64 @@ export default function App() {
       setStatus({ message: t("noExecutableFound"), tone: "warning" });
       return;
     }
-    const next: AppSettings = { ...settingsDraft, openclawExecutablePath: picked.executablePath, openclawDataDir: picked.dataDir ?? settingsDraft.openclawDataDir };
+    const next: AppSettings = picked.runtimeKind === "wsl"
+      ? {
+          ...settingsDraft,
+          runtimeTarget: {
+            kind: "wsl",
+            wslDistro: picked.wslDistro ?? "",
+            wslOpenclawPath: picked.executablePath,
+            wslDataDir: picked.dataDir ?? settingsDraft.runtimeTarget.wslDataDir
+          }
+        }
+      : {
+          ...settingsDraft,
+          openclawExecutablePath: picked.executablePath,
+          openclawDataDir: picked.dataDir ?? settingsDraft.openclawDataDir,
+          runtimeTarget: {
+            ...settingsDraft.runtimeTarget,
+            kind: "windows"
+          }
+        };
     setSettingsDraft(next);
     saveSettingsMutation.mutate(next);
+  };
+
+  const onCheckForUpdates = async () => {
+    setCheckingUpdates(true);
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateSummary(null);
+        setStatus({ message: t("noUpdateAvailable"), tone: "success" });
+        return;
+      }
+      setUpdateSummary({ version: update.version, notes: update.body });
+      setStatus({ message: t("updateAvailableStatus", { version: update.version }), tone: "success" });
+    } catch (error) {
+      setStatus({ message: readableError(error, t("checkUpdatesFailed")), tone: "error" });
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
+  const onInstallUpdate = async () => {
+    setInstallingUpdate(true);
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateSummary(null);
+        setStatus({ message: t("noUpdateAvailable"), tone: "success" });
+        return;
+      }
+      await update.downloadAndInstall();
+      setStatus({ message: t("updaterRestarting"), tone: "success" });
+      await relaunch();
+    } catch (error) {
+      setStatus({ message: readableError(error, t("installUpdateFailed")), tone: "error" });
+    } finally {
+      setInstallingUpdate(false);
+    }
   };
 
   const onDetectOpenclaw = async () => {
@@ -621,7 +711,7 @@ export default function App() {
                 <div className="hero-note"><div className="hero-note-row"><span>{t("lastLaunch")}</span><strong>{activeLaunchRecord ? formatTime(activeLaunchRecord.launchedAt) : recentLaunch ? formatTime(recentLaunch.launchedAt) : t("noLaunchRecordYet")}</strong></div></div>
               </div>
             </section>
-            <div className="build-signature">2026/3/11 0.1.2 @ixing</div>
+            <div className="build-signature">2026/3/11 0.1.3 @ixing</div>
           </section>
         ) : null}
         {store.page === "profiles" ? (
@@ -829,9 +919,54 @@ export default function App() {
             <section className="page-header"><div><h2>{t("settingsTitle")}</h2><p className="muted">{t("settingsDescription")}</p></div><button className="button primary" onClick={() => saveSettingsMutation.mutate(settingsDraft)}>{t("saveSettings")}</button></section>
             <section className="panel">
               <div className="panel-header settings-header"><div><h3>{t("basicSettings")}</h3><p className="muted">{t("defaultExecutableIs", { path: DEFAULT_EXECUTABLE_PATH })}</p><p className="muted">{t("defaultDirectoryIs", { path: DEFAULT_OPENCLAW_PATH })}</p></div><button className="button secondary" onClick={() => void onDetectOpenclaw()}>{detectQuery.isFetching ? t("detecting") : t("autoDetect")}</button></div>
-              <div className="setting-fields"><InputGroup label={t("executablePath")} value={settingsDraft.openclawExecutablePath || ""} placeholder={DEFAULT_EXECUTABLE_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawExecutablePath: value }))} /><InputGroup label={t("localLobsterDirectory")} value={settingsDraft.openclawDataDir || ""} placeholder={DEFAULT_OPENCLAW_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawDataDir: value }))} /></div>
-              <div className="button-row wrap"><button className="button ghost" onClick={() => api.pickOpenclawExecutable().then((value) => { if (value) setSettingsDraft((current) => ({ ...current, openclawExecutablePath: value })); })}>{IS_MAC ? t("chooseAppOrExecutable") : t("chooseExecutable")}</button><button className="button ghost" onClick={() => api.pickDirectory().then((value) => { if (value) setSettingsDraft((current) => ({ ...current, openclawDataDir: value })); })}>{t("chooseLocalDirectory")}</button></div>
-              {(detectQuery.data ?? []).map((candidate) => <div key={candidate.executablePath} className="candidate-card"><DetailRow label={t("source")} value={translateBackendText(candidate.source)} /><DetailRow label={t("executablePath")} value={candidate.executablePath} /><DetailRow label={t("lobsterDirectory")} value={candidate.dataDir || t("unknown")} /><button className="button ghost" onClick={() => onApplyDetection(candidate)}>{t("useThisResult")}</button></div>)}
+              <div className="setting-fields">
+                <label className="input-group">
+                  <span>{isEnglish ? "Runtime Target" : "运行环境"}</span>
+                  <select value={settingsDraft.runtimeTarget.kind} onChange={(event) => setSettingsDraft((current) => ({ ...current, runtimeTarget: { ...current.runtimeTarget, kind: event.target.value as "windows" | "wsl" } }))}>
+                    <option value="windows">Windows</option>
+                    <option value="wsl">WSL</option>
+                  </select>
+                </label>
+                {settingsDraft.runtimeTarget.kind === "wsl" ? (
+                  <>
+                    <InputGroup label={isEnglish ? "WSL Distro" : "WSL 发行版"} value={settingsDraft.runtimeTarget.wslDistro || ""} placeholder="Ubuntu" onChange={(value) => setSettingsDraft((current) => ({ ...current, runtimeTarget: { ...current.runtimeTarget, wslDistro: value } }))} />
+                    <InputGroup label={isEnglish ? "WSL OpenClaw Path" : "WSL OpenClaw 路径"} value={settingsDraft.runtimeTarget.wslOpenclawPath || ""} placeholder="/home/user/.local/bin/openclaw" onChange={(value) => setSettingsDraft((current) => ({ ...current, runtimeTarget: { ...current.runtimeTarget, wslOpenclawPath: value } }))} />
+                    <InputGroup label={isEnglish ? "WSL Data Directory" : "WSL 数据目录"} value={settingsDraft.runtimeTarget.wslDataDir || ""} placeholder="/home/user/.openclaw" onChange={(value) => setSettingsDraft((current) => ({ ...current, runtimeTarget: { ...current.runtimeTarget, wslDataDir: value } }))} />
+                  </>
+                ) : (
+                  <>
+                    <InputGroup label={t("executablePath")} value={settingsDraft.openclawExecutablePath || ""} placeholder={DEFAULT_EXECUTABLE_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawExecutablePath: value }))} />
+                    <InputGroup label={t("localLobsterDirectory")} value={settingsDraft.openclawDataDir || ""} placeholder={DEFAULT_OPENCLAW_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawDataDir: value }))} />
+                  </>
+                )}
+              </div>
+              {settingsDraft.runtimeTarget.kind === "windows" ? <div className="button-row wrap"><button className="button ghost" onClick={() => api.pickOpenclawExecutable().then((value) => { if (value) setSettingsDraft((current) => ({ ...current, openclawExecutablePath: value })); })}>{IS_MAC ? t("chooseAppOrExecutable") : t("chooseExecutable")}</button><button className="button ghost" onClick={() => api.pickDirectory().then((value) => { if (value) setSettingsDraft((current) => ({ ...current, openclawDataDir: value })); })}>{t("chooseLocalDirectory")}</button></div> : null}
+              {(detectQuery.data ?? []).map((candidate) => <div key={`${candidate.runtimeKind}:${candidate.wslDistro || "windows"}:${candidate.executablePath}`} className="candidate-card"><DetailRow label={isEnglish ? "Runtime" : "运行环境"} value={candidate.runtimeKind === "wsl" ? `WSL${candidate.wslDistro ? ` (${candidate.wslDistro})` : ""}` : "Windows"} /><DetailRow label={t("source")} value={translateBackendText(candidate.source)} /><DetailRow label={t("executablePath")} value={candidate.executablePath} /><DetailRow label={t("lobsterDirectory")} value={candidate.dataDir || t("unknown")} /><button className="button ghost" onClick={() => onApplyDetection(candidate)}>{t("useThisResult")}</button></div>)}
+            </section>
+            <section className="panel">
+              <div className="panel-header settings-header">
+                <div>
+                  <h3>{t("updatesTitle")}</h3>
+                  <p className="muted">{t("updatesDescription")}</p>
+                </div>
+                <button className="button secondary" onClick={() => void onCheckForUpdates()} disabled={checkingUpdates || installingUpdate}>
+                  {checkingUpdates ? t("checkingForUpdates") : t("checkForUpdates")}
+                </button>
+              </div>
+              <div className="candidate-card">
+                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.3"} />
+                {updateSummary ? (
+                  <>
+                    <DetailRow label={t("checkForUpdates")} value={updateSummary.version} />
+                    {updateSummary.notes ? <div className="detail-row"><span>{t("releaseNotesLabel")}</span><span>{updateSummary.notes}</span></div> : null}
+                    <div className="button-row wrap">
+                      <button className="button primary" onClick={() => void onInstallUpdate()} disabled={checkingUpdates || installingUpdate}>
+                        {installingUpdate ? t("installingUpdate") : t("installUpdate")}
+                      </button>
+                    </div>
+                  </>
+                ) : <p className="muted">{t("updaterUnavailable")}</p>}
+              </div>
             </section>
             <details className="panel advanced-panel" open={advancedOpen} onToggle={(event) => setAdvancedOpen((event.currentTarget as HTMLDetailsElement).open)}>
               <summary>{advancedOpen ? t("collapseAdvancedSettings") : t("expandAdvancedSettings")}</summary>
@@ -1011,3 +1146,5 @@ function conversationBelongsToProfile(conversationId: string, profileId?: string
 function profileSessionKey(profileId?: string) {
   return !profileId || profileId === LOCAL_PROFILE_ID ? "local" : profileId;
 }
+
+
