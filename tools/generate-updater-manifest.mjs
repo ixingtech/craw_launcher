@@ -8,6 +8,7 @@ if (!locale || !version || !tag || !repo || !pubDate) {
 }
 
 const releaseDir = path.resolve("src-tauri", "target", "release");
+const bundleDir = path.resolve("src-tauri", "target", "release", "bundle", "nsis");
 const assetName =
   locale === "zh-CN"
     ? `小龙虾启动器_${version}_windows_x64.exe`
@@ -21,7 +22,10 @@ const notes =
 
 const sigPath = path.join(releaseDir, sigName);
 if (!fs.existsSync(sigPath)) {
-  throw new Error(`missing signature file: ${sigPath}`);
+  const bundleSigPath = path.join(bundleDir, sigName);
+  throw new Error(
+    `missing signature file: ${sigPath} (also checked ${bundleSigPath}); ensure bundle.createUpdaterArtifacts is enabled`
+  );
 }
 
 const manifest = {
