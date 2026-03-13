@@ -643,7 +643,9 @@ fn build_wsl_script(
 }
 
 fn run_wsl_capture(distro: &str, script: &str) -> Option<(bool, String, String)> {
-    let output = Command::new("wsl.exe")
+    let mut command = Command::new("wsl.exe");
+    apply_windows_process_flags(&mut command);
+    let output = command
         .arg("-d")
         .arg(distro)
         .arg("--")
@@ -661,8 +663,46 @@ fn run_wsl_capture(distro: &str, script: &str) -> Option<(bool, String, String)>
     ))
 }
 
+fn detect_wsl_openclaw_path(distro: &str) -> Option<String> {
+    let script = r#"
+if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1; fi
+if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1; fi
+if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1; fi
+for candidate in \
+  "$(command -v openclaw 2>/dev/null)" \
+  "$HOME/.nvm/versions/node/$(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | tail -n 1)/bin/openclaw" \
+  "$HOME/.local/bin/openclaw" \
+  "/usr/local/bin/openclaw" \
+  "/usr/bin/openclaw"
+do
+  if [ -n "$candidate" ] && [ -x "$candidate" ] && [ "${candidate#/mnt/}" = "$candidate" ]; then
+    printf %s "$candidate"
+    exit 0
+  fi
+done
+exit 1
+"#;
+    run_wsl_capture(distro, script)
+        .and_then(|(success, stdout, _)| success.then_some(stdout))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn sort_path_candidates(candidates: &mut [PathCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .validation
+            .is_valid
+            .cmp(&left.validation.is_valid)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| left.runtime_kind.cmp(&right.runtime_kind))
+            .then_with(|| left.executable_path.cmp(&right.executable_path))
+    });
+}
+
 fn detect_wsl_openclaw_candidates() -> Vec<PathCandidate> {
-    let distro_output = Command::new("wsl.exe")
+    let mut distro_command = Command::new("wsl.exe");
+    apply_windows_process_flags(&mut distro_command);
+    let distro_output = distro_command
         .arg("-l")
         .arg("-q")
         .stdout(Stdio::piped())
@@ -679,14 +719,9 @@ fn detect_wsl_openclaw_candidates() -> Vec<PathCandidate> {
         .filter(|line| !line.is_empty())
         .enumerate()
     {
-        let Some((true, executable_path, _)) =
-            run_wsl_capture(distro, "command -v openclaw 2>/dev/null")
-        else {
+        let Some(executable_path) = detect_wsl_openclaw_path(distro) else {
             continue;
         };
-        if executable_path.is_empty() {
-            continue;
-        }
         let data_dir = run_wsl_capture(distro, "printf %s \"$HOME/.openclaw\"")
             .map(|(_, stdout, _)| stdout)
             .filter(|value| !value.trim().is_empty());
@@ -696,16 +731,19 @@ fn detect_wsl_openclaw_candidates() -> Vec<PathCandidate> {
         let data_dir_ok = inferred
             .as_ref()
             .is_some_and(|path| looks_like_openclaw_data_dir(path));
+        let install_dir = Path::new(&executable_path)
+            .parent()
+            .map(display_path);
         output.push(PathCandidate {
-            executable_path,
+            executable_path: executable_path.clone(),
             data_dir,
             source: "wsl-scan".to_string(),
             score: 130 - index as i32,
             runtime_kind: RUNTIME_KIND_WSL.to_string(),
             wsl_distro: Some(distro.to_string()),
             validation: ValidationResult {
-                executable_path: Some("wsl".to_string()),
-                install_dir: None,
+                executable_path: Some(executable_path),
+                install_dir,
                 inferred_data_dir: inferred.map(|path| path.display().to_string()),
                 supports_profile_switch: true,
                 is_valid: data_dir_ok,
@@ -717,6 +755,7 @@ fn detect_wsl_openclaw_candidates() -> Vec<PathCandidate> {
             },
         });
     }
+    sort_path_candidates(&mut output);
     output
 }
 
@@ -851,7 +890,7 @@ fn detect_openclaw(app: AppHandle) -> Result<Vec<PathCandidate>, String> {
         });
     }
     output.extend(detect_wsl_openclaw_candidates());
-    output.sort_by(|left, right| right.score.cmp(&left.score));
+    sort_path_candidates(&mut output);
     Ok(output)
 }
 
@@ -903,12 +942,6 @@ fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
     if settings.openclaw_data_dir.is_none() {
         settings.openclaw_data_dir =
             default_openclaw_data_dir_path().map(|path| path.display().to_string());
-    }
-
-    if settings.openclaw_executable_path.is_none() {
-        settings.openclaw_executable_path =
-            detect_first_openclaw_command().map(|path| path.display().to_string());
-        normalized = normalized || settings.openclaw_executable_path.is_some();
     }
 
     if settings.profiles_root.is_none() || settings_uses_legacy_profiles_root(&app, &settings) {
@@ -1119,7 +1152,7 @@ fn save_profile_readme(
 #[tauri::command]
 fn delete_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
     if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
-        return Err("默认本地龙虾不能删除.".into());
+        return Err("默认龙虾不能删除.".into());
     }
 
     let mut settings = load_settings(app.clone())?;
@@ -1151,7 +1184,7 @@ fn rename_profile(
     name: String,
 ) -> Result<ManagedProfile, String> {
     if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
-        return Err("默认本地龙虾不能改名.".into());
+        return Err("默认龙虾不能改名.".into());
     }
 
     let next_name = name.trim();
@@ -1876,37 +1909,31 @@ fn common_openclaw_candidates() -> Vec<(String, i32)> {
 
     if cfg!(target_os = "windows") {
         if let Ok(appdata) = env::var("APPDATA") {
-            candidates.push((
-                PathBuf::from(&appdata)
-                    .join("npm")
-                    .join("openclaw.cmd")
-                    .display()
-                    .to_string(),
+            push_windows_command_shim_candidates(
+                &mut candidates,
+                &PathBuf::from(&appdata).join("npm"),
                 115,
-            ));
-            candidates.push((
-                PathBuf::from(&appdata)
-                    .join("npm")
-                    .join("openclaw")
-                    .display()
-                    .to_string(),
-                110,
-            ));
+            );
         }
         if let Some(user_home) = default_user_home() {
-            candidates.push((
-                user_home
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("npm")
-                    .join("openclaw.cmd")
-                    .display()
-                    .to_string(),
+            push_windows_command_shim_candidates(
+                &mut candidates,
+                &user_home.join("AppData").join("Roaming").join("npm"),
                 112,
-            ));
+            );
+        }
+        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+            push_windows_command_shim_candidates(
+                &mut candidates,
+                &PathBuf::from(&local_app_data).join("pnpm"),
+                111,
+            );
         }
         for candidate in where_openclaw_candidates() {
             candidates.push((candidate.display().to_string(), 118));
+        }
+        for candidate in path_openclaw_candidates() {
+            candidates.push((candidate.display().to_string(), 108));
         }
         for (var, score) in [
             ("ProgramFiles", 100),
@@ -1976,6 +2003,19 @@ fn common_openclaw_candidates() -> Vec<(String, i32)> {
         }
     }
     candidates
+}
+
+fn push_windows_command_shim_candidates(
+    candidates: &mut Vec<(String, i32)>,
+    directory: &Path,
+    score: i32,
+) {
+    for (offset, file_name) in ["openclaw.cmd", "openclaw", "openclaw.exe"]
+        .into_iter()
+        .enumerate()
+    {
+        candidates.push((directory.join(file_name).display().to_string(), score - offset as i32));
+    }
 }
 
 fn infer_data_dir(executable_path: &Path) -> Option<PathBuf> {
@@ -3113,12 +3153,6 @@ fn merge_chat_errors(primary: &str, fallback: &str) -> String {
     lines.join("\n")
 }
 
-fn acp_session_key(profile_id: &str, conversation_id: &str) -> String {
-    let profile = sanitize_session_key_part(profile_id);
-    let conversation = sanitize_session_key_part(conversation_id);
-    format!("launcher:{profile}:{conversation}")
-}
-
 fn sanitize_session_key_part(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -3519,8 +3553,6 @@ struct LaunchTarget {
     profile_name: String,
     profile_path: String,
     runtime_profile_path: String,
-    runtime_kind: String,
-    wsl_distro: Option<String>,
     cli_profile_name: Option<String>,
     use_state_dir_env: bool,
     managed_profile: Option<ManagedProfile>,
@@ -3541,8 +3573,6 @@ fn resolve_launch_target(
             profile_name: "Default Local".to_string(),
             profile_path,
             runtime_profile_path: runtime_target.data_dir.clone(),
-            runtime_kind: runtime_target.kind,
-            wsl_distro: runtime_target.wsl_distro,
             cli_profile_name: None,
             use_state_dir_env: true,
             managed_profile: None,
@@ -3570,11 +3600,9 @@ fn resolve_launch_target(
 
         return Ok(LaunchTarget {
             profile_id: LOCAL_PROFILE_ID.to_string(),
-            profile_name: "默认本地龙虾".to_string(),
+            profile_name: "默认龙虾".to_string(),
             profile_path: path.clone(),
             runtime_profile_path: path.clone(),
-            runtime_kind: runtime_target.kind.clone(),
-            wsl_distro: runtime_target.wsl_distro.clone(),
             cli_profile_name: None,
             use_state_dir_env: true,
             managed_profile: None,
@@ -3594,8 +3622,6 @@ fn resolve_launch_target(
         profile_name: profile.name.clone(),
         profile_path: profile.path.clone(),
         runtime_profile_path: profile.path.clone(),
-        runtime_kind: runtime_target.kind,
-        wsl_distro: runtime_target.wsl_distro,
         cli_profile_name: Some(cli_profile_name_for(&profile.name, &profile.id)),
         use_state_dir_env: false,
         managed_profile: Some(profile),
@@ -3619,7 +3645,7 @@ fn resolve_profile_root(
             .openclaw_data_dir
             .clone()
             .or_else(|| default_openclaw_data_dir_path().map(|path| display(&path)))
-            .ok_or_else(|| "没有找到默认本地龙虾目录.".to_string())?;
+            .ok_or_else(|| "没有找到默认龙虾目录.".to_string())?;
         return Ok(PathBuf::from(path));
     }
 
@@ -3647,16 +3673,6 @@ fn managed_profile_name_from_dir(path: &Path) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "profile".to_string())
-}
-
-fn profile_cli_name_from_path(path: &Path) -> Option<String> {
-    let user_home = default_user_home()?;
-    if path.parent()? != user_home {
-        return None;
-    }
-    let name = path.file_name()?.to_str()?;
-    let cli_name = name.strip_prefix(".openclaw-")?;
-    is_valid_cli_profile_name(cli_name).then(|| cli_name.to_string())
 }
 
 fn ensure_managed_profile_launch_path(
@@ -3693,11 +3709,6 @@ fn ensure_managed_profile_launch_path(
         path: desired_path.display().to_string(),
         ..profile
     })
-}
-
-#[allow(unreachable_code)]
-fn load_profile_metadata(path: &Path) -> Result<ManagedProfile, String> {
-    load_profile_metadata_impl(path)
 }
 
 fn unique_profile_dir_name(root: &Path, requested: &str) -> String {
@@ -3849,17 +3860,6 @@ fn managed_gateway_port(profile_id: &str) -> u16 {
     20000 + (hash % 20000) as u16
 }
 
-fn is_valid_cli_profile_name(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_alphabetic())
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-}
-
 fn default_user_home() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         env::var("USERPROFILE").ok().map(PathBuf::from)
@@ -3943,19 +3943,54 @@ fn where_openclaw_candidates() -> Vec<PathBuf> {
         return Vec::new();
     }
 
-    let Ok(output) = Command::new("where").arg("openclaw").output() else {
-        return Vec::new();
-    };
-    if !output.status.success() {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for name in ["openclaw", "openclaw.cmd", "openclaw.exe"] {
+        let mut command = Command::new("where.exe");
+        apply_windows_process_flags(&mut command);
+        let Ok(output) = command.arg(name).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let path = PathBuf::from(line);
+            if seen.insert(path.clone()) {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn path_openclaw_candidates() -> Vec<PathBuf> {
+    if !cfg!(target_os = "windows") {
         return Vec::new();
     }
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let Some(path_var) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+
+    for directory in env::split_paths(&path_var) {
+        for file_name in ["openclaw.cmd", "openclaw", "openclaw.exe"] {
+            let candidate = directory.join(file_name);
+            if seen.insert(candidate.clone()) && candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates
 }
 
 fn is_cmd_like(path: &Path) -> bool {
@@ -3974,10 +4009,6 @@ fn normalize_openclaw_command_path(path: &Path) -> Option<PathBuf> {
         return path.exists().then(|| path.to_path_buf());
     }
 
-    if path.exists() && path.is_file() {
-        return Some(path.to_path_buf());
-    }
-
     if cfg!(target_os = "windows") {
         for extension in ["cmd", "bat", "exe"] {
             let candidate = path.with_extension(extension);
@@ -3985,6 +4016,10 @@ fn normalize_openclaw_command_path(path: &Path) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
+    }
+
+    if path.exists() && path.is_file() {
+        return Some(path.to_path_buf());
     }
 
     None
@@ -5314,12 +5349,14 @@ mod tests {
         apply_gateway_defaults, cli_profile_name_for, collect_cron_items,
         collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
         extract_agent_cli_text, gateway_config_for_target, infer_data_dir, linux_path_to_wsl_unc,
-        normalize_runtime_kind, resolve_direct_openclaw_cli,
-        is_valid_cli_profile_name, is_valid_openclaw_command_path, localize_preview_json_times,
+        normalize_openclaw_command_path, normalize_runtime_kind, resolve_direct_openclaw_cli,
+        is_valid_openclaw_command_path,
+        localize_preview_json_times, sort_path_candidates,
         looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
         preview_cron_item, preview_setting_document_item, preview_skill_item, read_json,
         schedule_summary_from_value, should_skip_export_path, validate_chat_runtime_for_target,
         verify_import_package_impl, AppSettings, ExportProfileRequest, GatewayConfig, LaunchTarget,
+        PathCandidate, ValidationResult,
     };
     use std::{env, fs, fs::File};
     use uuid::Uuid;
@@ -5781,7 +5818,6 @@ mod tests {
 
     #[test]
     fn numeric_profile_names_fall_back_to_internal_cli_name() {
-        assert!(!is_valid_cli_profile_name("1"));
         assert_eq!(
             cli_profile_name_for("1", "12345678-aaaa-bbbb-cccc-abcdef123456"),
             "profile-12345678aaaabbbbccccabcdef123456"
@@ -5882,8 +5918,6 @@ mod tests {
                 profile_name: "Local".into(),
                 profile_path: root.display().to_string(),
                 runtime_profile_path: root.display().to_string(),
-                runtime_kind: "windows".to_string(),
-                wsl_distro: None,
                 cli_profile_name: None,
                 use_state_dir_env: false,
                 managed_profile: None,
@@ -5906,8 +5940,6 @@ mod tests {
             profile_name: "Imported".into(),
             profile_path: root.display().to_string(),
             runtime_profile_path: root.display().to_string(),
-            runtime_kind: "windows".to_string(),
-            wsl_distro: None,
             cli_profile_name: Some("profile-managed".into()),
             use_state_dir_env: false,
             managed_profile: None,
@@ -5950,6 +5982,49 @@ mod tests {
     }
 
     #[test]
+    fn sort_path_candidates_prefers_valid_results() {
+        let mut candidates = vec![
+            PathCandidate {
+                executable_path: "wsl-openclaw".into(),
+                data_dir: None,
+                source: "wsl-scan".into(),
+                score: 130,
+                runtime_kind: "wsl".into(),
+                wsl_distro: Some("Ubuntu".into()),
+                validation: ValidationResult {
+                    executable_path: Some("wsl-openclaw".into()),
+                    install_dir: None,
+                    inferred_data_dir: None,
+                    supports_profile_switch: true,
+                    is_valid: false,
+                    issues: vec!["missing data dir".into()],
+                },
+            },
+            PathCandidate {
+                executable_path: "C:\\openclaw.cmd".into(),
+                data_dir: Some("C:\\Users\\demo\\.openclaw".into()),
+                source: "scan".into(),
+                score: 120,
+                runtime_kind: "windows".into(),
+                wsl_distro: None,
+                validation: ValidationResult {
+                    executable_path: Some("C:\\openclaw.cmd".into()),
+                    install_dir: Some("C:\\".into()),
+                    inferred_data_dir: Some("C:\\Users\\demo\\.openclaw".into()),
+                    supports_profile_switch: true,
+                    is_valid: true,
+                    issues: Vec::new(),
+                },
+            },
+        ];
+
+        sort_path_candidates(&mut candidates);
+
+        assert_eq!(candidates[0].runtime_kind, "windows");
+        assert!(candidates[0].validation.is_valid);
+    }
+
+    #[test]
     fn resolve_direct_openclaw_cli_uses_module_entry_for_cmd_shim() {
         let root = env::temp_dir().join(format!("openclaw-cli-shim-test-{}", Uuid::new_v4()));
         let executable = root.join("openclaw.cmd");
@@ -5968,6 +6043,23 @@ mod tests {
             .expect("expected npm shim to resolve");
         assert_eq!(resolved_node, bundled_node);
         assert_eq!(resolved_entry, cli_entry);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalize_windows_bare_openclaw_path_prefers_cmd_shim() {
+        let root = env::temp_dir().join(format!("openclaw-bare-shim-test-{}", Uuid::new_v4()));
+        let bare = root.join("openclaw");
+        let cmd = root.join("openclaw.cmd");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&bare, b"#!/bin/sh\n").unwrap();
+        fs::write(&cmd, b"@echo off\r\n").unwrap();
+
+        let normalized = normalize_openclaw_command_path(&bare).unwrap();
+
+        assert_eq!(normalized, cmd);
 
         let _ = fs::remove_dir_all(&root);
     }

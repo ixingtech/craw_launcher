@@ -118,7 +118,7 @@ const messages = {
     detecting: "识别中...",
     autoDetect: "自动识别",
     executablePath: "OpenClaw 启动入口",
-    localLobsterDirectory: "默认本地龙虾目录",
+    localLobsterDirectory: "默认龙虾目录",
     chooseAppOrExecutable: "选择 .app 或启动入口",
     chooseExecutable: "选择启动入口",
     chooseLocalDirectory: "选择本地目录",
@@ -309,7 +309,7 @@ const messages = {
     detecting: "Detecting...",
     autoDetect: "Auto Detect",
     executablePath: "OpenClaw Executable",
-    localLobsterDirectory: "Default Local Craw Directory",
+    localLobsterDirectory: "Default Craw Directory",
     chooseAppOrExecutable: "Choose .app or executable",
     chooseExecutable: "Choose executable",
     chooseLocalDirectory: "Choose local directory",
@@ -404,7 +404,11 @@ export function t(key: MessageKey, vars?: Record<string, string | number>) {
 }
 
 const backendExactMap: Record<string, string> = {
-  "默认本地龙虾": "Default Local Craw",
+  "默认龙虾": "Default Craw",
+  "默认龙虾不能删除.": "The default craw cannot be deleted.",
+  "默认龙虾不能改名.": "The default craw cannot be renamed.",
+  "没有找到默认龙虾目录.": "The default craw directory was not found.",
+  "默认本地龙虾": "Default Craw",
   "工作区设定文档": "Workspace Setting Document",
   "主记忆库": "Main Memory Database",
   "本地身份文件": "Local Identity File",
@@ -437,8 +441,8 @@ const backendExactMap: Record<string, string> = {
   "不支持的预览类型.": "Unsupported preview type.",
   "只能导入 .claw 格式的龙虾包。": "Only .claw craw packages can be imported.",
   "你正尝试导入的龙虾被篡改过.": "The craw package appears to have been tampered with.",
-  "默认本地龙虾不能删除.": "The default local craw cannot be deleted.",
-  "默认本地龙虾不能改名.": "The default local craw cannot be renamed.",
+  "默认本地龙虾不能删除.": "The default craw cannot be deleted.",
+  "默认本地龙虾不能改名.": "The default craw cannot be renamed.",
   "龙虾名称不能为空.": "Craw name cannot be empty.",
   "这只龙虾自己的连接服务没有启动成功。": "This craw's own gateway service failed to start.",
   "没有连上连接服务，请确认地址和健康检查接口.": "The gateway service is not reachable. Check the address and health endpoint."

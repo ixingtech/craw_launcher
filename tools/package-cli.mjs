@@ -6,6 +6,12 @@ const root = process.cwd();
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const version = pkg.version;
 const targetDir = path.join(root, "src-tauri", "target", "release");
+const locale = process.argv[2] ?? null;
+const supportedLocales = new Set(["zh-CN", "en-US"]);
+
+if (locale && !supportedLocales.has(locale)) {
+  throw new Error(`unsupported locale: ${locale}`);
+}
 
 const platformMap = {
   win32: { os: "windows", bin: "claws-cli.exe", ext: "zip" },
@@ -29,7 +35,8 @@ if (!fs.existsSync(binaryPath)) {
   throw new Error(`missing binary: ${binaryPath}`);
 }
 
-const artifactBase = `claws-cli_${version}_${platform.os}_${arch}`;
+const localeSuffix = locale ? `_${locale}` : "";
+const artifactBase = `claws-cli_${version}_${platform.os}_${arch}${localeSuffix}`;
 const artifactPath = path.join(targetDir, `${artifactBase}.${platform.ext}`);
 
 if (fs.existsSync(artifactPath)) {

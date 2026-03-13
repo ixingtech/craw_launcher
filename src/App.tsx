@@ -91,6 +91,7 @@ export default function App() {
   const queryClient = useQueryClient();
   const store = useAppStore();
   const needsProfiles = store.page === "profiles" || store.page === "chat" || store.page === "notifications" || store.page === "docs";
+  const [autoDetectionAttempted, setAutoDetectionAttempted] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(defaultSettings);
   const [chatDraft, setChatDraft] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -199,6 +200,43 @@ export default function App() {
   useEffect(() => {
     if (settingsQuery.data) setSettingsDraft(settingsQuery.data);
   }, [settingsQuery.data]);
+
+  useEffect(() => {
+    const current = settingsQuery.data;
+    if (!current || autoDetectionAttempted) {
+      return;
+    }
+
+    const windowsReady = Boolean(current.openclawExecutablePath && current.openclawDataDir);
+    const wslReady = Boolean(
+      current.runtimeTarget.wslDistro &&
+      current.runtimeTarget.wslOpenclawPath &&
+      current.runtimeTarget.wslDataDir
+    );
+    const currentRuntimeReady = current.runtimeTarget.kind === "wsl" ? wslReady : windowsReady;
+
+    if (currentRuntimeReady) {
+      setAutoDetectionAttempted(true);
+      return;
+    }
+
+    setAutoDetectionAttempted(true);
+    void detectQuery.refetch()
+      .then((result) => {
+        const candidates = result.data ?? [];
+        const preferredRuntime = current.runtimeTarget.kind;
+        const preferred =
+          candidates.find((item) => item.runtimeKind === preferredRuntime && item.validation.isValid) ||
+          candidates.find((item) => item.runtimeKind === preferredRuntime) ||
+          candidates.find((item) => item.validation.isValid) ||
+          candidates[0];
+
+        if (preferred) {
+          onApplyDetection(preferred, current);
+        }
+      })
+      .catch(() => {});
+  }, [autoDetectionAttempted, detectQuery, settingsQuery.data]);
 
   useEffect(() => {
     let cancelled = false;
@@ -467,28 +505,28 @@ export default function App() {
     }
   });
 
-  const onApplyDetection = (candidate?: PathCandidate) => {
-    const picked = candidate || detectQuery.data?.[0];
+  const onApplyDetection = (candidate?: PathCandidate, baseSettings: AppSettings = settingsDraft) => {
+    const picked = candidate || detectQuery.data?.find((item) => item.validation.isValid) || detectQuery.data?.[0];
     if (!picked) {
       setStatus({ message: t("noExecutableFound"), tone: "warning" });
       return;
     }
     const next: AppSettings = picked.runtimeKind === "wsl"
       ? {
-          ...settingsDraft,
+          ...baseSettings,
           runtimeTarget: {
             kind: "wsl",
             wslDistro: picked.wslDistro ?? "",
             wslOpenclawPath: picked.executablePath,
-            wslDataDir: picked.dataDir ?? settingsDraft.runtimeTarget.wslDataDir
+            wslDataDir: picked.dataDir ?? baseSettings.runtimeTarget.wslDataDir
           }
         }
       : {
-          ...settingsDraft,
+          ...baseSettings,
           openclawExecutablePath: picked.executablePath,
-          openclawDataDir: picked.dataDir ?? settingsDraft.openclawDataDir,
+          openclawDataDir: picked.dataDir ?? baseSettings.openclawDataDir,
           runtimeTarget: {
-            ...settingsDraft.runtimeTarget,
+            ...baseSettings.runtimeTarget,
             kind: "windows"
           }
         };
@@ -541,7 +579,7 @@ export default function App() {
         setStatus({ message: t("noExecutableFound"), tone: "warning" });
         return;
       }
-      onApplyDetection(candidates[0]);
+      onApplyDetection(candidates.find((item) => item.validation.isValid) || candidates[0]);
     } catch (error) {
       setStatus({ message: readableError(error, t("autoDetectFailed")), tone: "error" });
     }
@@ -711,7 +749,7 @@ export default function App() {
                 <div className="hero-note"><div className="hero-note-row"><span>{t("lastLaunch")}</span><strong>{activeLaunchRecord ? formatTime(activeLaunchRecord.launchedAt) : recentLaunch ? formatTime(recentLaunch.launchedAt) : t("noLaunchRecordYet")}</strong></div></div>
               </div>
             </section>
-            <div className="build-signature">2026/3/11 0.1.3 @ixing</div>
+            <div className="build-signature">2026/3/13 0.1.4 @ixing</div>
           </section>
         ) : null}
         {store.page === "profiles" ? (
@@ -936,7 +974,7 @@ export default function App() {
                 ) : (
                   <>
                     <InputGroup label={t("executablePath")} value={settingsDraft.openclawExecutablePath || ""} placeholder={DEFAULT_EXECUTABLE_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawExecutablePath: value }))} />
-                    <InputGroup label={t("localLobsterDirectory")} value={settingsDraft.openclawDataDir || ""} placeholder={DEFAULT_OPENCLAW_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawDataDir: value }))} />
+                    <InputGroup label={isEnglish ? t("localLobsterDirectory") : "默认龙虾目录"} value={settingsDraft.openclawDataDir || ""} placeholder={DEFAULT_OPENCLAW_PATH} onChange={(value) => setSettingsDraft((current) => ({ ...current, openclawDataDir: value }))} />
                   </>
                 )}
               </div>
@@ -954,7 +992,7 @@ export default function App() {
                 </button>
               </div>
               <div className="candidate-card">
-                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.3"} />
+                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.4"} />
                 {updateSummary ? (
                   <>
                     <DetailRow label={t("checkForUpdates")} value={updateSummary.version} />
