@@ -3,7 +3,7 @@
     "beforeBuildCommand": "node tools/set-build-locale.mjs en-US && pnpm build"
   },
   "productName": "Craw Launcher",
-  "mainBinaryName": "Craw Launcher",
+  "mainBinaryName": "openclaw_launcher",
   "app": {
     "windows": [
       {

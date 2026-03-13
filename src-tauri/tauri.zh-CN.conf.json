@@ -3,7 +3,7 @@
     "beforeBuildCommand": "node tools/set-build-locale.mjs zh-CN && pnpm build"
   },
   "productName": "小龙虾启动器",
-  "mainBinaryName": "小龙虾启动器",
+  "mainBinaryName": "openclaw_launcher",
   "app": {
     "windows": [
       {
