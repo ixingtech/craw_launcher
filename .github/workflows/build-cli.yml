@@ -37,7 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build CLI
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin claws-cli --release
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin claws-cli --features standalone-cli --release
 
       - name: Detect version
         shell: bash
