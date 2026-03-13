@@ -12,6 +12,9 @@
     "build:nsis": "pnpm build:nsis:zh-CN && pnpm build:nsis:en-US",
     "build:nsis:zh-CN": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.zh-CN.conf.json && node tools/rename-nsis-artifact.mjs zh-CN",
     "build:nsis:en-US": "tauri build --bundles nsis --no-sign --config src-tauri/tauri.en-US.conf.json && node tools/rename-nsis-artifact.mjs en-US",
+    "build:nsis:ci": "pnpm build:nsis:ci:zh-CN && pnpm build:nsis:ci:en-US",
+    "build:nsis:ci:zh-CN": "tauri build --bundles nsis --config src-tauri/tauri.zh-CN.conf.json && node tools/rename-nsis-artifact.mjs zh-CN",
+    "build:nsis:ci:en-US": "tauri build --bundles nsis --config src-tauri/tauri.en-US.conf.json && node tools/rename-nsis-artifact.mjs en-US",
     "preview": "vite preview",
     "tauri": "tauri"
   },
