@@ -1,0 +1,79 @@
+name: build-cli
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feat/standalone-cli
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_os: linux
+            binary_name: claws-cli
+            archive_ext: tar.gz
+          - os: macos-latest
+            artifact_os: macos
+            binary_name: claws-cli
+            archive_ext: tar.gz
+          - os: windows-latest
+            artifact_os: windows
+            binary_name: claws-cli.exe
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build CLI
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin claws-cli --release
+
+      - name: Detect version
+        shell: bash
+        run: |
+          version="$(node -e "console.log(JSON.parse(require('node:fs').readFileSync('package.json','utf8')).version)")"
+          echo "CLI_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Detect arch
+        shell: bash
+        run: |
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) artifact_arch="x64" ;;
+            arm64|aarch64) artifact_arch="arm64" ;;
+            *) artifact_arch="$arch" ;;
+          esac
+          echo "ARTIFACT_ARCH=$artifact_arch" >> "$GITHUB_ENV"
+
+      - name: Package unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          artifact="claws-cli_${CLI_VERSION}_${{ matrix.artifact_os }}_${ARTIFACT_ARCH}.${{ matrix.archive_ext }}"
+          tar -czf "$artifact" -C src-tauri/target/release "${{ matrix.binary_name }}"
+          echo "ARTIFACT_PATH=$artifact" >> "$GITHUB_ENV"
+
+      - name: Package windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifact = "claws-cli_${env:CLI_VERSION}_${{ matrix.artifact_os }}_${env:ARTIFACT_ARCH}.${{ matrix.archive_ext }}"
+          Compress-Archive -Path "src-tauri/target/release/${{ matrix.binary_name }}" -DestinationPath $artifact -Force
+          "ARTIFACT_PATH=$artifact" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claws-cli-${{ matrix.artifact_os }}-${{ env.ARTIFACT_ARCH }}
+          path: ${{ env.ARTIFACT_PATH }}

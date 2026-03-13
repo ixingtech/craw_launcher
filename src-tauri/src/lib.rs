@@ -1,4 +1,5 @@
 mod build_locale;
+mod cli;
 
 use chrono::Utc;
 use reqwest::blocking::Client;
@@ -36,6 +37,11 @@ fn updater_pubkey() -> &'static str {
 struct RuntimeState {
     gateway: Mutex<GatewayRuntime>,
     subscriber: Mutex<SubscriberRuntime>,
+}
+
+#[derive(Clone, Debug)]
+struct LauncherContext {
+    app_data_dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -549,6 +555,10 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenClaw Launcher");
+}
+
+pub fn cli_main() -> Result<(), String> {
+    cli::run()
 }
 
 #[derive(Clone)]
