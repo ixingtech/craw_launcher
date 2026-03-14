@@ -2,7 +2,11 @@
 
 `openclaw-launcher` is a desktop launcher for managing and running local OpenClaw profiles. It provides a GUI for selecting profile directories, importing and exporting `.claw` packages, viewing profile contents, chatting with the current profile, and maintaining the local gateway/runtime state used by OpenClaw.
 
-中文产品名：
+Chinese README:
+
+- [README.zh-CN.md](README.zh-CN.md)
+
+Chinese product name:
 
 - `xiaolongxia` / `小龙虾启动器`
 
