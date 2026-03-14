@@ -60,6 +60,7 @@ export const api = {
   sendChatMessage: (conversationId: string, request: ChatRequest) =>
     invoke<void>("send_chat_message", { conversationId, request }),
   openControlWeb: (profileId: string) => invoke<void>("open_control_web", { profileId }),
+  openLobsterTerminal: (profileId: string) => invoke<void>("open_lobster_terminal", { profileId }),
   pickOpenclawExecutable: () => invoke<string | null>("pick_openclaw_executable"),
   pickDirectory: () => invoke<string | null>("pick_directory"),
   desktopPath: () => invoke<string | null>("desktop_path"),

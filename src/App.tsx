@@ -27,6 +27,7 @@ import type {
 } from "./lib/types";
 
 const LOCAL_PROFILE_ID = "__local__";
+const APP_VERSION = "0.1.6";
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 const DEFAULT_OPENCLAW_PATH = IS_MAC ? "~/.openclaw" : `C:\\Users\\${isEnglish ? "your-name" : "你的用户名"}\\.openclaw`;
 const DEFAULT_EXECUTABLE_PATH = IS_MAC
@@ -48,6 +49,11 @@ type ExportState = {
   exportDir: string;
   includeMemory: boolean;
   includeAccountInfo: boolean;
+};
+
+type LaunchingState = {
+  profileId: string;
+  startedAt: string;
 };
 
 type PreviewState = {
@@ -82,6 +88,7 @@ const defaultSettings: AppSettings = {
     wslDataDir: ""
   },
   profilesRoot: "",
+  closeLaunchedProfilesOnExit: true,
   gatewayConfig: {
     mode: "manual",
     command: "",
@@ -107,6 +114,7 @@ export default function App() {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [launchingState, setLaunchingState] = useState<LaunchingState | null>(null);
   const [docDraft, setDocDraft] = useState("");
   const [docEditing, setDocEditing] = useState(false);
   const [previewState, setPreviewState] = useState<PreviewState>({
@@ -135,6 +143,7 @@ export default function App() {
     includeAccountInfo: false
   });
   const shouldPollGateway =
+    store.page === "overview" ||
     store.page === "chat" ||
     store.page === "notifications" ||
     store.page === "profiles" ||
@@ -196,6 +205,16 @@ export default function App() {
   useEffect(() => {
     void getVersion().then(setCurrentVersion).catch(() => setCurrentVersion(""));
   }, []);
+
+  useEffect(() => {
+    if (!status || status.tone !== "success") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setStatus((current) => (current?.message === status.message && current.tone === status.tone ? null : current));
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [status]);
 
   useEffect(() => {
     if (!docEditing) {
@@ -343,10 +362,25 @@ export default function App() {
     refetchOnWindowFocus: false,
     staleTime: 15000
   });
-  const gatewayOnline = Boolean(gatewayQuery.data?.running && gatewayQuery.data?.healthy);
-  const isProfileRunning = (profileId: string) => gatewayOnline && activeLobsterId === profileId;
-  const activeLobsterRunning = isProfileRunning(activeLobsterId);
-  const viewingLobsterRunning = isProfileRunning(viewingLobsterId);
+  const gatewayOwnsProfile = (status: GatewayStatus | undefined, profileId: string) =>
+    Boolean(status?.profileId && status.profileId === profileId);
+  const isProfileRunning = (status: GatewayStatus | undefined, profileId: string) =>
+    Boolean(status?.running && status?.healthy && gatewayOwnsProfile(status, profileId));
+  const activeLobsterRunning = isProfileRunning(gatewayQuery.data, activeLobsterId);
+  const viewingLobsterRunning = isProfileRunning(gatewayQuery.data, viewingLobsterId);
+
+  useEffect(() => {
+    if (!launchingState) return;
+    const sameProfile = gatewayOwnsProfile(gatewayQuery.data, launchingState.profileId);
+    if (!sameProfile) return;
+    if (gatewayQuery.data?.healthy) {
+      setLaunchingState(null);
+    }
+  }, [
+    gatewayQuery.data?.healthy,
+    gatewayQuery.data?.profileId,
+    launchingState
+  ]);
   const conversations = useMemo(
     () => (conversationSummariesQuery.data ?? []).filter((conversation) => conversationBelongsToProfile(conversation.id, activeLobsterId)),
     [conversationSummariesQuery.data, activeLobsterId]
@@ -459,29 +493,44 @@ export default function App() {
   });
   const launchMutation = useMutation({
     mutationFn: api.launchOpenclaw,
+    onMutate: (profileId) => {
+      setLaunchingState({ profileId, startedAt: new Date().toISOString() });
+    },
     onSuccess: async (handle) => {
       store.setActiveProfileId(handle.profileId);
       store.setViewingProfileId(handle.profileId);
+      setLaunchingState({ profileId: handle.profileId, startedAt: handle.startedAt });
       queryClient.setQueryData<GatewayStatus>(["gateway-status"], (current) => ({
         mode: current?.mode || "manual",
         url: current?.url || settingsDraft.gatewayConfig.url,
+        profileId: handle.profileId,
         running: true,
-        healthy: true,
+        healthy: false,
         pid: handle.pid ?? current?.pid ?? null,
         startedAt: handle.startedAt,
         lastError: null,
         logTail: current?.logTail ?? []
       }));
-      setStatus({ message: t("launchedStatus", { name: translateBackendText(handle.profileName) }), tone: "success" });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
       await queryClient.invalidateQueries({ queryKey: ["profiles"] });
-      await queryClient.invalidateQueries({ queryKey: ["gateway-status"] });
+      const gatewayResult = await gatewayQuery.refetch();
+      if (
+        gatewayResult.data?.profileId === handle.profileId &&
+        gatewayResult.data?.healthy
+      ) {
+        setLaunchingState(null);
+      }
     },
-    onError: (error) => setStatus({ message: readableError(error, t("launchLobsterFailed")), tone: "error" })
+    onError: (error) => {
+      setLaunchingState(null);
+      setStatus({ message: readableError(error, t("launchLobsterFailed")), tone: "error" });
+    }
   });
   const launchingProfileId = launchMutation.isPending ? launchMutation.variables : undefined;
-  const activeLobsterLaunching = launchingProfileId === activeLobsterId;
-  const viewingLobsterLaunching = launchingProfileId === viewingLobsterId;
+  const activeLobsterLaunching =
+    launchingProfileId === activeLobsterId || launchingState?.profileId === activeLobsterId;
+  const viewingLobsterLaunching =
+    launchingProfileId === viewingLobsterId || launchingState?.profileId === viewingLobsterId;
 
   const saveReadmeMutation = useMutation({
     mutationFn: ({ profileId, content }: { profileId: string; content: string }) => api.saveProfileReadme(profileId, content),
@@ -611,8 +660,11 @@ export default function App() {
       .catch((error) => setStatus({ message: readableError(error, t("createConversationFailed")), tone: "error" }));
   };
 
-  const onSend = () => {
+  const onSend = async () => {
     if (!store.selectedConversationId || !chatDraft.trim()) return;
+    if (!await ensureLobsterStarted(activeLobsterId)) {
+      return;
+    }
     sendMutation.mutate({ conversationId: store.selectedConversationId, content: chatDraft.trim(), profileId: activeLobsterId });
   };
 
@@ -722,12 +774,42 @@ export default function App() {
     }
   };
 
+  const ensureLobsterStarted = async (profileId: string) => {
+    if (isProfileRunning(gatewayQuery.data, profileId)) {
+      return true;
+    }
+    const result = await gatewayQuery.refetch();
+    if (result.error) {
+      throw result.error;
+    }
+    if (isProfileRunning(result.data, profileId)) {
+      return true;
+    }
+    setStatus({ message: t("pleaseStartLobsterFirst"), tone: "warning" });
+    return false;
+  };
+
   const onOpenControlWeb = async (profileId: string) => {
     try {
+      if (!await ensureLobsterStarted(profileId)) {
+        return;
+      }
       await api.openControlWeb(profileId);
       setStatus({ message: t("controlWebOpened"), tone: "success" });
     } catch (error) {
       setStatus({ message: readableError(error, t("openControlWebFailed")), tone: "error" });
+    }
+  };
+
+  const onOpenLobsterTerminal = async (profileId: string) => {
+    try {
+      if (!await ensureLobsterStarted(profileId)) {
+        return;
+      }
+      await api.openLobsterTerminal(profileId);
+      setStatus({ message: t("lobsterTerminalOpened"), tone: "success" });
+    } catch (error) {
+      setStatus({ message: readableError(error, t("openLobsterTerminalFailed")), tone: "error" });
     }
   };
 
@@ -745,7 +827,7 @@ export default function App() {
         </nav>
         <section className="sidebar-card">
           <span className="section-tag">{t("currentStatus")}</span>
-          <StatusPill tone={needsSetup ? "warn" : activeLobsterLaunching || activeLobsterRunning ? "good" : "muted"} label={needsSetup ? t("needSetup") : activeLobsterLaunching ? t("launching") : activeLobsterRunning ? t("launched") : t("canLaunch")} />
+          <StatusPill tone={needsSetup ? "warn" : activeLobsterLaunching ? "warn" : activeLobsterRunning ? "good" : "muted"} label={needsSetup ? t("needSetup") : activeLobsterLaunching ? t("launching") : activeLobsterRunning ? t("launched") : t("canLaunch")} />
           <DetailRow label={t("currentLobster")} value={activeLobsterName} />
         </section>
       </aside>
@@ -757,12 +839,36 @@ export default function App() {
               <div className="hero-copy"><h2>{t("heroTitle")}</h2><p>{t("heroDescription", { name: activeLobsterName, path: DEFAULT_OPENCLAW_PATH.split("\\").join("\\") })}</p></div>
               <div className="hero-action">
                 <button className="button primary large" onClick={() => launchMutation.mutate(activeLobsterId)} disabled={needsSetup || activeLobsterLaunching}>{activeLobsterLaunching ? t("launching") : activeLobsterRunning ? t("launched") : t("launchLobster")}</button>
-                <button className="button ghost" onClick={() => store.setPage("profiles")}>{t("switchLobster")}</button>
-                <button className="button ghost" onClick={() => onOpenControlWeb(activeLobsterId)} disabled={needsSetup}>{t("openControlWeb")}</button>
+                <button className="button ghost" onClick={() => void onOpenControlWeb(activeLobsterId)} disabled={needsSetup}>{t("openControlWeb")}</button>
+                <button className="button ghost" onClick={() => void onOpenLobsterTerminal(activeLobsterId)} disabled={needsSetup}>{t("openLobsterTerminal")}</button>
                 <div className="hero-note"><div className="hero-note-row"><span>{t("lastLaunch")}</span><strong>{activeLaunchRecord ? formatTime(activeLaunchRecord.launchedAt) : recentLaunch ? formatTime(recentLaunch.launchedAt) : t("noLaunchRecordYet")}</strong></div></div>
               </div>
             </section>
-            <div className="build-signature">2026/3/14 0.1.5 @ixing</div>
+            <section className="panel">
+              <div className="panel-header settings-header">
+                <div>
+                  <h3>{t("updatesTitle")}</h3>
+                  <p className="muted">{t("updatesDescription")}</p>
+                </div>
+                <button className="button secondary" onClick={() => void onCheckForUpdates()} disabled={checkingUpdates || installingUpdate}>
+                  {checkingUpdates ? t("checkingForUpdates") : t("checkForUpdates")}
+                </button>
+              </div>
+              <div className="candidate-card">
+                <DetailRow label={t("currentVersionLabel")} value={currentVersion || APP_VERSION} />
+                {updateState.kind === "available" ? (
+                  <>
+                    <DetailRow label={t("checkForUpdates")} value={updateState.version} />
+                    {updateState.notes ? <div className="detail-row"><span>{t("releaseNotesLabel")}</span><span>{updateState.notes}</span></div> : null}
+                    <div className="button-row wrap">
+                      <button className="button primary" onClick={() => void onInstallUpdate()} disabled={checkingUpdates || installingUpdate}>
+                        {installingUpdate ? t("installingUpdate") : t("installUpdate")}
+                      </button>
+                    </div>
+                  </>
+                ) : updateState.kind === "latest" ? <p className="muted">{t("noUpdateAvailable")}</p> : updateState.kind === "unavailable" ? <p className="muted">{t("updaterUnavailable")}</p> : <p className="muted">{t("checkingForUpdates")}</p>}
+              </div>
+            </section>
           </section>
         ) : null}
         {store.page === "profiles" ? (
@@ -878,7 +984,7 @@ export default function App() {
                       {store.selectedConversationId && store.streamingBuffer[store.selectedConversationId] ? <article className="message assistant"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("generating")}</time></div><MessageContent content={store.streamingBuffer[store.selectedConversationId]} /></article> : null}
                       {store.selectedConversationId && waitingForReply && !store.streamingBuffer[store.selectedConversationId] ? <article className="message assistant loading"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("processing")}</time></div><div className="loading-reply"><span className="loading-spinner" aria-hidden="true" /><span>{t("thinkingMessage")}</span></div></article> : null}
                     </div>
-                    <div className="composer"><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={t("composePlaceholder", { name: activeLobsterName })} /><div className="button-row"><button className="button primary" onClick={() => onSend()}>{t("sendToName", { name: activeLobsterName })}</button></div></div>
+                    <div className="composer"><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={t("composePlaceholder", { name: activeLobsterName })} /><div className="button-row"><button className="button primary" onClick={() => void onSend()}>{t("sendToName", { name: activeLobsterName })}</button></div></div>
                   </>
                 ) : <div className="empty-state">{t("selectConversationEmpty")}</div>}
               </div>
@@ -997,26 +1103,21 @@ export default function App() {
             <section className="panel">
               <div className="panel-header settings-header">
                 <div>
-                  <h3>{t("updatesTitle")}</h3>
-                  <p className="muted">{t("updatesDescription")}</p>
+                  <h3>{t("launcherBehavior")}</h3>
                 </div>
-                <button className="button secondary" onClick={() => void onCheckForUpdates()} disabled={checkingUpdates || installingUpdate}>
-                  {checkingUpdates ? t("checkingForUpdates") : t("checkForUpdates")}
-                </button>
               </div>
-              <div className="candidate-card">
-                <DetailRow label={t("currentVersionLabel")} value={currentVersion || "0.1.5"} />
-                {updateState.kind === "available" ? (
-                  <>
-                    <DetailRow label={t("checkForUpdates")} value={updateState.version} />
-                    {updateState.notes ? <div className="detail-row"><span>{t("releaseNotesLabel")}</span><span>{updateState.notes}</span></div> : null}
-                    <div className="button-row wrap">
-                      <button className="button primary" onClick={() => void onInstallUpdate()} disabled={checkingUpdates || installingUpdate}>
-                        {installingUpdate ? t("installingUpdate") : t("installUpdate")}
-                      </button>
-                    </div>
-                  </>
-                ) : updateState.kind === "latest" ? <p className="muted">{t("noUpdateAvailable")}</p> : updateState.kind === "unavailable" ? <p className="muted">{t("updaterUnavailable")}</p> : <p className="muted">{t("checkingForUpdates")}</p>}
+              <div className="toggle-list">
+                <label className="toggle-card">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.closeLaunchedProfilesOnExit}
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, closeLaunchedProfilesOnExit: event.target.checked }))}
+                  />
+                  <div>
+                    <strong>{t("closeProfilesOnExitLabel")}</strong>
+                    <p className="muted">{t("closeProfilesOnExitDescription")}</p>
+                  </div>
+                </label>
               </div>
             </section>
             <details className="panel advanced-panel" open={advancedOpen} onToggle={(event) => setAdvancedOpen((event.currentTarget as HTMLDetailsElement).open)}>
@@ -1025,7 +1126,10 @@ export default function App() {
                 <section className="sub-panel"><h3>{t("lobsterDirectorySection")}</h3><InputGroup label={t("importedLobsterSaveLocation")} value={settingsDraft.profilesRoot || ""} placeholder={t("appDefaultDirectory")} onChange={(value) => setSettingsDraft((current) => ({ ...current, profilesRoot: value }))} /><button className="button ghost" onClick={() => api.pickDirectory().then((value) => { if (value) setSettingsDraft((current) => ({ ...current, profilesRoot: value })); })}>{t("chooseDirectory")}</button></section>
                 <section className="sub-panel"><h3>{t("connectionService")}</h3><InputGroup label={t("connectionAddress")} value={settingsDraft.gatewayConfig.url} onChange={(value) => setSettingsDraft((current) => ({ ...current, gatewayConfig: { ...current.gatewayConfig, url: value } }))} /><InputGroup label={t("healthEndpoint")} value={settingsDraft.gatewayConfig.healthEndpoint} onChange={(value) => setSettingsDraft((current) => ({ ...current, gatewayConfig: { ...current.gatewayConfig, healthEndpoint: value } }))} /><div className="button-row wrap"><button className="button ghost" onClick={() => api.startGateway(settingsDraft.gatewayConfig.mode, settingsDraft.gatewayConfig).then(() => queryClient.invalidateQueries({ queryKey: ["gateway-status"] }))}>{t("startConnectionService")}</button><button className="button ghost" onClick={() => api.stopGateway().then(() => queryClient.invalidateQueries({ queryKey: ["gateway-status"] }))}>{t("stopConnectionService")}</button></div></section>
               </div>
-              <div className="button-row start advanced-actions"><button className="button ghost" onClick={() => setSettingsDraft((current) => ({ ...current, profilesRoot: defaultSettings.profilesRoot, gatewayConfig: { ...defaultSettings.gatewayConfig } }))}>{t("resetAdvancedSettings")}</button></div>
+              <div className="button-row start advanced-actions">
+                <p className="muted advanced-warning">{t("advancedSettingsWarning")}</p>
+                <button className="button ghost" onClick={() => setSettingsDraft((current) => ({ ...current, profilesRoot: defaultSettings.profilesRoot, gatewayConfig: { ...defaultSettings.gatewayConfig } }))}>{t("resetAdvancedSettings")}</button>
+              </div>
             </details>
           </section>
         ) : null}

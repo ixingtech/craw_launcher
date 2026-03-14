@@ -422,7 +422,7 @@ fn resolve_profile_root_in_cli_context(
             .openclaw_data_dir
             .clone()
             .or_else(|| default_openclaw_data_dir_path().map(|path| display(&path)))
-            .ok_or_else(|| "没有找到默认本地龙虾目录.".to_string())?;
+            .ok_or_else(|| "没有找到默认龙虾目录.".to_string())?;
         return Ok(PathBuf::from(path));
     }
 
@@ -447,7 +447,7 @@ fn ensure_managed_profile_launch_path_in_cli_context(
     let desired_dir_name = format!(".openclaw-{desired_cli_name}");
     let desired_path = root.join(&desired_dir_name);
     if current_path == desired_path {
-        normalize_managed_profile_runtime(&desired_path, &profile.id)?;
+        normalize_managed_profile_runtime(&desired_path, &profile.id, Some(settings))?;
         return Ok(profile);
     }
 
@@ -460,7 +460,7 @@ fn ensure_managed_profile_launch_path_in_cli_context(
         fs::remove_dir_all(&current_path).map_err(to_string_error)?;
     }
 
-    normalize_managed_profile_runtime(&desired_path, &profile.id)?;
+    normalize_managed_profile_runtime(&desired_path, &profile.id, Some(settings))?;
 
     Ok(ManagedProfile {
         path: desired_path.display().to_string(),
@@ -502,7 +502,7 @@ fn resolve_launch_target_in_cli_context(
 
         return Ok(LaunchTarget {
             profile_id: LOCAL_PROFILE_ID.to_string(),
-            profile_name: "默认本地龙虾".to_string(),
+            profile_name: "默认龙虾".to_string(),
             profile_path: path.clone(),
             runtime_profile_path: path,
             cli_profile_name: None,
@@ -616,7 +616,7 @@ fn import_profile_in_cli_context(
             last_used_at: profile.last_used_at.clone(),
         },
     )?;
-    normalize_managed_profile_runtime(&temp_target, &profile.id)?;
+    normalize_managed_profile_runtime(&temp_target, &profile.id, Some(&settings))?;
     fs::rename(&temp_target, &target).map_err(to_string_error)?;
 
     settings.recent_profile_id = Some(profile.id.clone());

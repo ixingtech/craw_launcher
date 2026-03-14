@@ -24,6 +24,7 @@
     ],
     "windows": {
       "nsis": {
+        "template": "windows/tauri-installer-template.nsi",
         "languages": [
           "English"
         ],

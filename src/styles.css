@@ -1059,6 +1059,15 @@ code {
 
 .advanced-actions {
   padding-top: 6px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.advanced-warning {
+  margin: 0;
+  max-width: 560px;
 }
 
 .toggle-list {

@@ -9,11 +9,11 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -33,10 +33,15 @@ fn updater_pubkey() -> &'static str {
     include_str!("../updater-public-key.pub").trim()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Default)]
 struct RuntimeState {
     gateway: Mutex<GatewayRuntime>,
     subscriber: Mutex<SubscriberRuntime>,
+    dashboard: Mutex<DashboardRuntime>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +62,12 @@ struct SubscriberRuntime {
     child: Option<Child>,
     profile_id: Option<String>,
     gateway_url: Option<String>,
+}
+
+#[derive(Default)]
+struct DashboardRuntime {
+    child: Option<Child>,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -146,6 +157,8 @@ struct AppSettings {
     openclaw_data_dir: Option<String>,
     runtime_target: RuntimeTargetConfig,
     profiles_root: Option<String>,
+    #[serde(default = "default_true")]
+    close_launched_profiles_on_exit: bool,
     gateway_config: GatewayConfig,
     recent_profile_id: Option<String>,
     recent_launches: Vec<LaunchRecord>,
@@ -158,6 +171,7 @@ impl Default for AppSettings {
             openclaw_data_dir: None,
             runtime_target: RuntimeTargetConfig::default(),
             profiles_root: None,
+            close_launched_profiles_on_exit: true,
             gateway_config: GatewayConfig::default(),
             recent_profile_id: None,
             recent_launches: Vec::new(),
@@ -264,6 +278,7 @@ struct LaunchHandle {
 struct GatewayStatus {
     mode: String,
     url: String,
+    profile_id: Option<String>,
     running: bool,
     pid: Option<u32>,
     started_at: Option<String>,
@@ -504,7 +519,7 @@ fn desktop_path() -> Option<String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_updater::Builder::new()
@@ -538,6 +553,7 @@ pub fn run() {
             delete_profile,
             launch_openclaw,
             open_control_web,
+            open_lobster_terminal,
             start_gateway,
             stop_gateway,
             gateway_status,
@@ -553,12 +569,57 @@ pub fn run() {
             pick_zip_file,
             pick_save_zip_path
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running OpenClaw Launcher");
+        .build(tauri::generate_context!())
+        .expect("error while building OpenClaw Launcher");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let should_cleanup = load_settings(app_handle.clone())
+                .map(|settings| settings.close_launched_profiles_on_exit)
+                .unwrap_or(true);
+            if should_cleanup {
+                cleanup_runtime_children(&app_handle.state::<RuntimeState>());
+            }
+        }
+    });
 }
 
 pub fn cli_main() -> Result<(), String> {
     cli::run()
+}
+
+fn cleanup_runtime_children(state: &State<'_, RuntimeState>) {
+    if let Ok(mut subscriber) = state.subscriber.lock() {
+        if let Some(child) = subscriber.child.as_mut() {
+            stop_child_process(child);
+        }
+        subscriber.child = None;
+        subscriber.profile_id = None;
+        subscriber.gateway_url = None;
+    }
+
+    if let Ok(mut dashboard) = state.dashboard.lock() {
+        if let Some(child) = dashboard.child.as_mut() {
+            stop_child_process(child);
+        }
+        dashboard.child = None;
+        dashboard.profile_id = None;
+    }
+
+    if let Ok(mut gateway) = state.gateway.lock() {
+        if let Some(child) = gateway.child.as_mut() {
+            stop_child_process(child);
+        }
+        gateway.child = None;
+        gateway.status.running = false;
+        gateway.status.healthy = false;
+        gateway.status.pid = None;
+        gateway.status.profile_id = None;
+        gateway.status.started_at = None;
+        gateway.status.last_error = None;
+        gateway.probe_in_flight = false;
+        gateway.last_probe_at = Some(SystemTime::now());
+    }
 }
 
 #[derive(Clone)]
@@ -1094,7 +1155,7 @@ fn import_profile_impl(
             last_used_at: profile.last_used_at.clone(),
         },
     )?;
-    normalize_managed_profile_runtime(&temp_target, &profile.id)?;
+    normalize_managed_profile_runtime(&temp_target, &profile.id, Some(&settings))?;
     fs::rename(&temp_target, &target).map_err(to_string_error)?;
 
     settings.recent_profile_id = Some(profile.id.clone());
@@ -1247,6 +1308,12 @@ fn open_control_web(
     state: State<'_, RuntimeState>,
 ) -> Result<(), String> {
     open_control_web_impl(app, profile_id, state)
+}
+
+#[tauri::command]
+#[allow(unreachable_code)]
+fn open_lobster_terminal(app: AppHandle, profile_id: String) -> Result<(), String> {
+    open_lobster_terminal_impl(app, profile_id)
 }
 
 #[tauri::command]
@@ -2116,10 +2183,10 @@ fn export_profile_impl(request: ExportProfileRequest) -> Result<PackageMeta, Str
             continue;
         }
 
-        zip.start_file(relative_path, options)
+        zip.start_file(&relative_path, options)
             .map_err(to_string_error)?;
-        let mut input = File::open(path).map_err(to_string_error)?;
-        std::io::copy(&mut input, &mut zip).map_err(to_string_error)?;
+        let content = export_file_content(path, &relative_path, include_account_info)?;
+        zip.write_all(&content).map_err(to_string_error)?;
         file_count += 1;
     }
 
@@ -2156,15 +2223,58 @@ fn collect_manifest_entries(
             continue;
         }
 
-        let metadata = fs::metadata(path).map_err(to_string_error)?;
+        let content = export_file_content(path, &relative_path, include_account_info)?;
         entries.push(ManifestEntry {
             path: relative_path,
-            size: metadata.len(),
-            sha256: sha256_file(path)?,
+            size: content.len() as u64,
+            sha256: sha256_bytes(&content),
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
+}
+
+fn export_file_content(
+    path: &Path,
+    relative_path: &str,
+    include_account_info: bool,
+) -> Result<Vec<u8>, String> {
+    if !include_account_info && is_openclaw_config_path(relative_path) {
+        return sanitize_openclaw_config_for_export(path);
+    }
+    fs::read(path).map_err(to_string_error)
+}
+
+fn is_openclaw_config_path(relative_path: &str) -> bool {
+    let normalized = relative_path.trim_start_matches("./");
+    normalized.eq_ignore_ascii_case("openclaw.json")
+        || normalized.ends_with("/openclaw.json")
+}
+
+fn sanitize_openclaw_config_for_export(path: &Path) -> Result<Vec<u8>, String> {
+    let mut config = read_json::<serde_json::Value>(path)?;
+    let Some(object) = config.as_object_mut() else {
+        return Err("openclaw.json 格式无效。".to_string());
+    };
+
+    object.remove("auth");
+
+    if let Some(gateway) = object.get_mut("gateway").and_then(|value| value.as_object_mut()) {
+        gateway.remove("auth");
+
+        if let Some(remote) = gateway.get_mut("remote").and_then(|value| value.as_object_mut()) {
+            remote.remove("token");
+            remote.remove("password");
+        }
+    }
+
+    serde_json::to_vec_pretty(&config).map_err(to_string_error)
+}
+
+fn sha256_bytes(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    format!("{:x}", hasher.finalize())
 }
 
 fn should_skip_export_path(
@@ -2177,14 +2287,7 @@ fn should_skip_export_path(
         return false;
     }
 
-    if !include_memory
-        && (normalized.starts_with("memory/")
-            || normalized.contains("/memory/")
-            || normalized.starts_with("sessions/")
-            || normalized.contains("/sessions/")
-            || normalized.eq_ignore_ascii_case("USER.md")
-            || normalized.ends_with("/USER.md"))
-    {
+    if !include_memory && is_history_export_path(normalized) {
         return true;
     }
 
@@ -2198,6 +2301,17 @@ fn should_skip_export_path(
     }
 
     false
+}
+
+fn is_history_export_path(normalized_path: &str) -> bool {
+    normalized_path.starts_with("memory/")
+        || normalized_path.contains("/memory/")
+        || normalized_path.starts_with("sessions/")
+        || normalized_path.contains("/sessions/")
+        || normalized_path.starts_with("cron/runs/")
+        || normalized_path.contains("/cron/runs/")
+        || normalized_path.eq_ignore_ascii_case("USER.md")
+        || normalized_path.ends_with("/USER.md")
 }
 
 fn pick_openclaw_executable_impl() -> Option<String> {
@@ -2316,14 +2430,14 @@ fn load_profile_metadata_impl(path: &Path) -> Result<ManagedProfile, String> {
 fn launch_openclaw_impl(
     app: AppHandle,
     profile_id: String,
-    _state: State<'_, RuntimeState>,
+    state: State<'_, RuntimeState>,
 ) -> Result<LaunchHandle, String> {
     let mut settings = load_settings(app.clone())?;
     if resolve_runtime_target(&settings)
         .map(|target| target.is_wsl())
         .unwrap_or(false)
     {
-        return launch_openclaw_impl_wsl(app, profile_id, settings);
+        return launch_openclaw_impl_wsl(app, profile_id, settings, state);
     }
 
     let executable = settings
@@ -2352,6 +2466,16 @@ fn launch_openclaw_impl(
         });
     }
     let started_at = now_iso();
+    let _ = set_gateway_runtime_status(
+        &state,
+        Some(launch_target.profile_id.clone()),
+        &gateway_config,
+        true,
+        gateway_ready,
+        None,
+        Some(started_at.clone()),
+        None,
+    );
     let mut command = build_openclaw_command(&executable_path);
     if let Some(profile_name) = launch_target.cli_profile_name.clone() {
         command.arg("--profile").arg(&profile_name);
@@ -2371,6 +2495,7 @@ fn launch_openclaw_impl(
     apply_gateway_env(&mut command, &gateway_config, &launch_target.profile_path);
 
     let child = command.spawn().map_err(to_string_error)?;
+    let child_pid = replace_dashboard_process(&state, child, &launch_target.profile_id)?;
     let mut args = Vec::new();
     if let Some(profile_name) = launch_target.cli_profile_name.clone() {
         args.push("--profile".into());
@@ -2380,7 +2505,7 @@ fn launch_openclaw_impl(
     args.push("--no-open".into());
 
     let handle = LaunchHandle {
-        pid: Some(child.id()),
+        pid: Some(child_pid),
         started_at: started_at.clone(),
         profile_id: launch_target.profile_id.clone(),
         profile_name: launch_target.profile_name.clone(),
@@ -2432,6 +2557,7 @@ fn launch_openclaw_impl_wsl(
     app: AppHandle,
     profile_id: String,
     mut settings: AppSettings,
+    state: State<'_, RuntimeState>,
 ) -> Result<LaunchHandle, String> {
     let runtime_target = resolve_runtime_target(&settings)?;
     let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
@@ -2450,6 +2576,17 @@ fn launch_openclaw_impl_wsl(
             );
         });
     }
+    let started_at = now_iso();
+    let _ = set_gateway_runtime_status(
+        &state,
+        Some(launch_target.profile_id.clone()),
+        &gateway_config,
+        true,
+        gateway_ready,
+        None,
+        Some(started_at.clone()),
+        None,
+    );
 
     let mut envs = Vec::new();
     apply_gateway_env_values(&mut envs, &gateway_config, &launch_target.profile_path);
@@ -2459,7 +2596,7 @@ fn launch_openclaw_impl_wsl(
         build_runtime_openclaw_command(&runtime_target, &args, &envs, current_dir.as_deref())?;
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let child = command.spawn().map_err(to_string_error)?;
-    let started_at = now_iso();
+    let child_pid = replace_dashboard_process(&state, child, &launch_target.profile_id)?;
 
     settings.recent_profile_id = Some(launch_target.profile_id.clone());
     settings.gateway_config = gateway_config;
@@ -2476,7 +2613,7 @@ fn launch_openclaw_impl_wsl(
     let _ = ensure_gateway_subscriber(&app, &saved_settings);
 
     Ok(LaunchHandle {
-        pid: Some(child.id()),
+        pid: Some(child_pid),
         started_at,
         profile_id: launch_target.profile_id,
         profile_name: launch_target.profile_name,
@@ -2488,6 +2625,53 @@ fn launch_openclaw_impl_wsl(
             "Starting WSL gateway".to_string()
         }),
     })
+}
+
+fn windows_terminal_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn build_windows_terminal_command_line(
+    executable_path: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> String {
+    let mut segments = envs
+        .iter()
+        .map(|(key, value)| format!("set \"{key}={}\"", value.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    let invocation = std::iter::once(windows_terminal_quote(executable_path))
+        .chain(args.iter().map(|arg| windows_terminal_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    segments.push(invocation);
+    segments.join(" && ")
+}
+
+fn spawn_windows_terminal(command_line: &str, working_dir: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new("cmd.exe");
+    if let Some(dir) = working_dir.filter(|value| !value.trim().is_empty()) {
+        command.current_dir(dir);
+    }
+    command
+        .arg("/K")
+        .arg(command_line)
+        .spawn()
+        .map_err(to_string_error)?;
+    Ok(())
+}
+
+fn resolve_windows_terminal_command(
+    executable_path: &Path,
+) -> Result<(String, Vec<String>), String> {
+    if let Some((node_path, cli_entry)) = resolve_direct_openclaw_cli(executable_path)? {
+        return Ok((
+            display_path(&node_path),
+            vec![display_path(&cli_entry)],
+        ));
+    }
+
+    Ok((display_path(executable_path), Vec::new()))
 }
 
 fn open_control_web_impl(
@@ -2563,6 +2747,7 @@ fn start_gateway_impl(
     let mut status = GatewayStatus {
         mode: mode.clone(),
         url: gateway_config.url.clone(),
+        profile_id: None,
         running: false,
         pid: None,
         started_at: None,
@@ -2634,7 +2819,7 @@ fn start_gateway_impl(
         .log_tail
         .push(format!("宸插惎鍔ㄨ繛鎺ユ湇鍔″懡浠わ細{command}"));
     status.healthy =
-        health_check_with_retry(&gateway_config, 6, Duration::from_millis(800)).is_ok();
+        health_check_with_retry(&gateway_config, 40, Duration::from_millis(800)).is_ok();
     if !status.healthy {
         status.last_error = Some("连接服务已启动，但健康检查没有通过.".into());
     }
@@ -2657,12 +2842,70 @@ fn stop_gateway_impl(state: State<'_, RuntimeState>) -> Result<GatewayStatus, St
     runtime.status.running = false;
     runtime.status.healthy = false;
     runtime.status.pid = None;
+    runtime.status.profile_id = None;
     runtime.status.started_at = None;
     runtime.probe_in_flight = false;
     runtime.last_probe_at = Some(SystemTime::now());
     runtime.status.log_tail.push("连接服务已停止.".into());
     runtime.status.log_tail = tail(runtime.status.log_tail.clone(), 10);
     Ok(runtime.status.clone())
+}
+
+fn stop_child_process(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn set_gateway_runtime_status(
+    state: &State<'_, RuntimeState>,
+    profile_id: Option<String>,
+    gateway_config: &GatewayConfig,
+    running: bool,
+    healthy: bool,
+    pid: Option<u32>,
+    started_at: Option<String>,
+    last_error: Option<String>,
+) -> Result<(), String> {
+    let mut runtime = state
+        .gateway
+        .lock()
+        .map_err(|_| "无法读取连接状态.".to_string())?;
+    runtime.status.mode = gateway_config.mode.clone();
+    runtime.status.url = gateway_config.url.clone();
+    runtime.status.profile_id = profile_id;
+    runtime.status.running = running;
+    runtime.status.healthy = healthy;
+    runtime.status.pid = pid;
+    runtime.status.started_at = started_at;
+    runtime.status.last_error = last_error;
+    Ok(())
+}
+
+fn replace_dashboard_child(runtime: &mut DashboardRuntime, child: Child, profile_id: String) -> u32 {
+    if let Some(previous) = runtime.child.as_mut() {
+        stop_child_process(previous);
+    }
+
+    let pid = child.id();
+    runtime.child = Some(child);
+    runtime.profile_id = Some(profile_id);
+    pid
+}
+
+fn replace_dashboard_process(
+    state: &State<'_, RuntimeState>,
+    child: Child,
+    profile_id: &str,
+) -> Result<u32, String> {
+    let mut runtime = state
+        .dashboard
+        .lock()
+        .map_err(|_| "鏃犳硶鏇存柊鍚姩杩涚▼鐘舵€?".to_string())?;
+    Ok(replace_dashboard_child(
+        &mut runtime,
+        child,
+        profile_id.to_string(),
+    ))
 }
 
 fn gateway_status_impl(
@@ -2683,6 +2926,7 @@ fn gateway_status_impl(
             runtime.status.running = false;
             runtime.status.healthy = false;
             runtime.status.pid = None;
+            runtime.status.profile_id = None;
             runtime.status.last_error = Some(format!("连接服务已退出：{exit}."));
             runtime.child = None;
             runtime.last_probe_at = Some(SystemTime::now());
@@ -2857,7 +3101,14 @@ fn ensure_target_gateway_running_with_runtime(
     runtime_target: &ResolvedRuntimeTarget,
     launch_target: &LaunchTarget,
 ) -> Result<GatewayConfig, String> {
-    let gateway_config = gateway_config_for_runtime_target(runtime_target, launch_target)?;
+    let mut gateway_config = gateway_config_for_runtime_target(runtime_target, launch_target)?;
+    if launch_target.managed_profile.is_some()
+        && health_check(&gateway_config).is_err()
+        && gateway_port_is_open(&gateway_config)
+    {
+        reassign_managed_gateway_port(launch_target)?;
+        gateway_config = gateway_config_for_runtime_target(runtime_target, launch_target)?;
+    }
 
     if health_check(&gateway_config).is_ok() {
         let mut runtime = state
@@ -2866,6 +3117,7 @@ fn ensure_target_gateway_running_with_runtime(
             .map_err(|_| "failed to lock gateway runtime".to_string())?;
         runtime.status.mode = gateway_config.mode.clone();
         runtime.status.url = gateway_config.url.clone();
+        runtime.status.profile_id = Some(launch_target.profile_id.clone());
         runtime.status.running = true;
         runtime.status.healthy = true;
         runtime.status.last_error = None;
@@ -2912,6 +3164,7 @@ fn ensure_target_gateway_running_with_runtime(
         runtime.status = GatewayStatus {
             mode: gateway_config.mode.clone(),
             url: gateway_config.url.clone(),
+            profile_id: Some(launch_target.profile_id.clone()),
             running: true,
             pid: Some(pid),
             started_at: Some(now_iso()),
@@ -2921,7 +3174,7 @@ fn ensure_target_gateway_running_with_runtime(
         };
     }
 
-    let healthy = health_check_with_retry(&gateway_config, 8, Duration::from_millis(600)).is_ok();
+    let healthy = health_check_with_retry(&gateway_config, 40, Duration::from_millis(800)).is_ok();
     let mut runtime = state
         .gateway
         .lock()
@@ -2941,7 +3194,14 @@ fn ensure_target_gateway_running(
     executable_path: &Path,
     launch_target: &LaunchTarget,
 ) -> Result<GatewayConfig, String> {
-    let gateway_config = gateway_config_for_target(executable_path, launch_target)?;
+    let mut gateway_config = gateway_config_for_target(executable_path, launch_target)?;
+    if launch_target.managed_profile.is_some()
+        && health_check(&gateway_config).is_err()
+        && gateway_port_is_open(&gateway_config)
+    {
+        reassign_managed_gateway_port(launch_target)?;
+        gateway_config = gateway_config_for_target(executable_path, launch_target)?;
+    }
 
     if health_check(&gateway_config).is_ok() {
         let mut runtime = state
@@ -2950,6 +3210,7 @@ fn ensure_target_gateway_running(
             .map_err(|_| "无法读取连接状态.".to_string())?;
         runtime.status.mode = gateway_config.mode.clone();
         runtime.status.url = gateway_config.url.clone();
+        runtime.status.profile_id = Some(launch_target.profile_id.clone());
         runtime.status.running = true;
         runtime.status.healthy = true;
         runtime.status.last_error = None;
@@ -3002,6 +3263,7 @@ fn ensure_target_gateway_running(
         runtime.status = GatewayStatus {
             mode: gateway_config.mode.clone(),
             url: gateway_config.url.clone(),
+            profile_id: Some(launch_target.profile_id.clone()),
             running: true,
             pid: Some(pid),
             started_at: Some(now_iso()),
@@ -3011,7 +3273,7 @@ fn ensure_target_gateway_running(
         };
     }
 
-    let healthy = health_check_with_retry(&gateway_config, 8, Duration::from_millis(600)).is_ok();
+    let healthy = health_check_with_retry(&gateway_config, 40, Duration::from_millis(800)).is_ok();
     let mut runtime = state
         .gateway
         .lock()
@@ -3069,14 +3331,52 @@ fn apply_gateway_env_values(
     }
 }
 
+#[allow(unreachable_code)]
 fn validate_chat_runtime_for_target(launch_target: &LaunchTarget) -> Result<(), String> {
+    let _ = launch_target;
+    return Ok(());
+
     let auth_path = Path::new(&launch_target.profile_path)
         .join("agents")
         .join("main")
         .join("agent")
         .join("auth-profiles.json");
     if auth_path.is_file() {
-        return Ok(());
+        let required_providers = required_model_providers(Path::new(&launch_target.profile_path))?;
+        if required_providers.is_empty() {
+            return Ok(());
+        }
+
+        let available_providers = configured_auth_providers(&auth_path)?;
+        let missing: Vec<String> = required_providers
+            .into_iter()
+            .filter(|provider| !available_providers.contains(provider))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let providers = if is_english_build() {
+            missing.join(", ")
+        } else {
+            missing.join("、")
+        };
+        return Err(if is_english_build() {
+            format!(
+                "Missing auth for provider(s): {providers}. Auth store: {}. Configure these providers in OpenClaw first or copy a matching auth-profiles.json.",
+                auth_path.display()
+            )
+        } else if launch_target.profile_id == LOCAL_PROFILE_ID {
+            format!(
+                "当前龙虾缺少以下模型提供方认证：{providers}。认证文件：{}。请先在当前电脑完成这些 provider 的 OpenClaw 配置。",
+                auth_path.display()
+            )
+        } else {
+            format!(
+                "这只导入的龙虾缺少以下模型提供方认证：{providers}。认证文件：{}。请先在当前电脑完成这些 provider 的 OpenClaw 配置，或复制包含对应 provider 的 auth-profiles.json。",
+                auth_path.display()
+            )
+        });
     }
 
     Err(if launch_target.profile_id == LOCAL_PROFILE_ID {
@@ -3084,6 +3384,92 @@ fn validate_chat_runtime_for_target(launch_target: &LaunchTarget) -> Result<(), 
     } else {
         "这只导入的龙虾缺少账号认证信息，无法直接聊天。默认导出不会包含 auth-profiles.json，请在当前电脑先完成 OpenClaw 配置，或重新导出包含账号信息的龙虾包。".to_string()
     })
+}
+
+fn configured_auth_providers(auth_path: &Path) -> Result<HashSet<String>, String> {
+    let value = read_json::<serde_json::Value>(auth_path)?;
+    let mut providers = HashSet::new();
+    if let Some(profiles) = value.get("profiles").and_then(|item| item.as_object()) {
+        for profile in profiles.values() {
+            if let Some(provider) = profile
+                .get("provider")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
+                providers.insert(provider.to_string());
+            }
+        }
+    }
+    Ok(providers)
+}
+
+fn required_model_providers(profile_root: &Path) -> Result<Vec<String>, String> {
+    let config_path = profile_root.join("openclaw.json");
+    if !config_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let value = read_json::<serde_json::Value>(&config_path)?;
+    let mut providers = BTreeSet::new();
+    if let Some(agents) = value.get("agents") {
+        collect_model_providers(agents, false, &mut providers);
+    }
+    Ok(providers.into_iter().collect())
+}
+
+fn collect_model_providers(
+    value: &serde_json::Value,
+    in_model_scope: bool,
+    providers: &mut BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, item) in object {
+                let next_in_model_scope = in_model_scope
+                    || matches!(key.as_str(), "model" | "models" | "primary" | "fallbacks");
+                if next_in_model_scope {
+                    if let Some(provider) = model_provider_from_ref(key) {
+                        providers.insert(provider);
+                    }
+                }
+                collect_model_providers(item, next_in_model_scope, providers);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_model_providers(item, in_model_scope, providers);
+            }
+        }
+        serde_json::Value::String(text) if in_model_scope => {
+            if let Some(provider) = model_provider_from_ref(text) {
+                providers.insert(provider);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn model_provider_from_ref(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ws://")
+        || trimmed.starts_with("wss://")
+    {
+        return None;
+    }
+
+    let (provider, model) = trimmed.split_once('/')?;
+    if provider.is_empty() || model.trim().is_empty() || provider.contains(':') {
+        return None;
+    }
+
+    provider
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        .then(|| provider.to_string())
 }
 
 fn read_gateway_auth_secret(data_dir: &Path) -> Option<(String, String)> {
@@ -3209,6 +3595,48 @@ fn resolve_node_executable(executable_path: &Path) -> Result<PathBuf, String> {
     let bundled_node = executable_dir.join("node.exe");
     if bundled_node.exists() {
         return Ok(bundled_node);
+    }
+
+    let mut where_command = Command::new("where.exe");
+    apply_windows_process_flags(&mut where_command);
+    if let Ok(output) = where_command
+        .arg("node")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            if let Some(path) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+            {
+                return Ok(path);
+            }
+        }
+    }
+
+    let mut where_command = Command::new("where.exe");
+    apply_windows_process_flags(&mut where_command);
+    if let Ok(output) = where_command
+        .arg("node")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            if let Some(path) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+            {
+                return Ok(path);
+            }
+        }
     }
 
     let mut probe_command = Command::new("node");
@@ -3570,7 +3998,7 @@ fn resolve_launch_target(
         let profile_path = runtime_target.file_data_dir.display().to_string();
         return Ok(LaunchTarget {
             profile_id: LOCAL_PROFILE_ID.to_string(),
-            profile_name: "Default Local".to_string(),
+            profile_name: "Default Craw".to_string(),
             profile_path,
             runtime_profile_path: runtime_target.data_dir.clone(),
             cli_profile_name: None,
@@ -3637,7 +4065,7 @@ fn resolve_profile_root(
         if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
             return Ok(resolve_runtime_target(settings)?.file_data_dir);
         }
-        return Err("WSL mode currently supports only the default local profile".to_string());
+        return Err("WSL mode currently supports only the default craw".to_string());
     }
 
     if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
@@ -3690,7 +4118,7 @@ fn ensure_managed_profile_launch_path(
     let desired_dir_name = format!(".openclaw-{desired_cli_name}");
     let desired_path = root.join(&desired_dir_name);
     if current_path == desired_path {
-        normalize_managed_profile_runtime(&desired_path, &profile.id)?;
+        normalize_managed_profile_runtime(&desired_path, &profile.id, Some(settings))?;
         return Ok(profile);
     }
 
@@ -3703,7 +4131,7 @@ fn ensure_managed_profile_launch_path(
         fs::remove_dir_all(&current_path).map_err(to_string_error)?;
     }
 
-    normalize_managed_profile_runtime(&desired_path, &profile.id)?;
+    normalize_managed_profile_runtime(&desired_path, &profile.id, Some(settings))?;
 
     Ok(ManagedProfile {
         path: desired_path.display().to_string(),
@@ -3758,7 +4186,11 @@ fn cli_profile_name_for(display_name: &str, profile_id: &str) -> String {
     format!("profile-{}", profile_id.replace('-', ""))
 }
 
-fn normalize_managed_profile_runtime(profile_root: &Path, profile_id: &str) -> Result<(), String> {
+fn normalize_managed_profile_runtime(
+    profile_root: &Path,
+    profile_id: &str,
+    settings: Option<&AppSettings>,
+) -> Result<(), String> {
     fs::create_dir_all(profile_root.join("workspace")).map_err(to_string_error)?;
 
     let config_path = profile_root.join("openclaw.json");
@@ -3818,11 +4250,12 @@ fn normalize_managed_profile_runtime(profile_root: &Path, profile_id: &str) -> R
         write_json(&config_path, &config)?;
     }
 
-    bootstrap_managed_auth(profile_root)?;
+    bootstrap_managed_auth(profile_root, settings)?;
+    merge_managed_profile_auth_settings(profile_root, settings)?;
     Ok(())
 }
 
-fn bootstrap_managed_auth(profile_root: &Path) -> Result<(), String> {
+fn bootstrap_managed_auth(profile_root: &Path, settings: Option<&AppSettings>) -> Result<(), String> {
     let target = profile_root
         .join("agents")
         .join("main")
@@ -3832,20 +4265,443 @@ fn bootstrap_managed_auth(profile_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let Some(default_root) = default_openclaw_data_dir_path() else {
+    for source_root in candidate_local_auth_roots(settings) {
+        let source = source_root
+            .join("agents")
+            .join("main")
+            .join("agent")
+            .join("auth-profiles.json");
+        if !source.is_file() {
+            continue;
+        }
+
+        ensure_parent(&target)?;
+        fs::copy(source, &target).map_err(to_string_error)?;
         return Ok(());
-    };
-    let source = default_root
+    }
+
+    Ok(())
+}
+
+fn open_lobster_terminal_impl(app: AppHandle, profile_id: String) -> Result<(), String> {
+    let settings = load_settings(app.clone())?;
+    let runtime_target = resolve_runtime_target(&settings)?;
+    let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
+
+    let mut args = Vec::new();
+    if let Some(profile_name) = launch_target.cli_profile_name.clone() {
+        args.push("--profile".to_string());
+        args.push(profile_name);
+    }
+
+    let mut envs = Vec::new();
+    if launch_target.use_state_dir_env {
+        envs.push((
+            "OPENCLAW_STATE_DIR".to_string(),
+            launch_target.runtime_profile_path.clone(),
+        ));
+    }
+
+    if runtime_target.is_wsl() {
+        let distro = runtime_target
+            .wsl_distro
+            .as_ref()
+            .ok_or_else(|| "Missing WSL distro".to_string())?;
+        let current_dir = linux_parent_dir(&runtime_target.executable_path);
+        let mut script = build_wsl_script(
+            &runtime_target.executable_path,
+            &args,
+            &envs,
+            current_dir.as_deref(),
+        );
+        if script.trim().is_empty() {
+            script = "exec bash".to_string();
+        } else {
+            script.push_str("; exec bash");
+        }
+
+        let mut command = Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg("wsl.exe")
+            .arg("-d")
+            .arg(distro)
+            .arg("--")
+            .arg("bash")
+            .arg("-lc")
+            .arg(script)
+            .spawn()
+            .map_err(to_string_error)?;
+        return Ok(());
+    }
+
+    let executable_path = PathBuf::from(&runtime_target.executable_path);
+    let working_dir = executable_path.parent().map(display_path);
+    let (command_path, mut command_args) = resolve_windows_terminal_command(&executable_path)?;
+    command_args.extend(args);
+    let command_line = build_windows_terminal_command_line(&command_path, &command_args, &envs);
+    spawn_windows_terminal(&command_line, working_dir.as_deref())
+}
+
+fn merge_managed_profile_auth_settings(
+    profile_root: &Path,
+    settings: Option<&AppSettings>,
+) -> Result<(), String> {
+    let config_path = profile_root.join("openclaw.json");
+    let auth_path = profile_root
         .join("agents")
         .join("main")
         .join("agent")
         .join("auth-profiles.json");
-    if !source.is_file() {
+
+    let required_providers = required_model_providers(profile_root)?;
+    let mut preferred_auth_keys = HashMap::new();
+    let source_roots = candidate_local_auth_roots(settings);
+    let source_config_root = source_roots
+        .iter()
+        .find(|root| root.join("openclaw.json").is_file())
+        .cloned();
+    let source_auth_root = source_roots
+        .iter()
+        .find(|root| {
+            root.join("agents")
+                .join("main")
+                .join("agent")
+                .join("auth-profiles.json")
+                .is_file()
+        })
+        .cloned();
+
+    if config_path.is_file() {
+        let mut target_config = read_json::<serde_json::Value>(&config_path)?;
+        let mut config_changed = false;
+
+        if let Some(source_root) = source_config_root.as_ref() {
+            let source_config_path = source_root.join("openclaw.json");
+            let source_config = read_json::<serde_json::Value>(&source_config_path)?;
+            config_changed |= merge_openclaw_auth_profiles(&mut target_config, &source_config);
+        }
+
+        preferred_auth_keys = openclaw_auth_profile_keys_by_provider(&target_config);
+
+        if config_changed {
+            write_json(&config_path, &target_config)?;
+        }
+    }
+
+    if !auth_path.is_file() {
         return Ok(());
     }
 
-    ensure_parent(&target)?;
-    fs::copy(source, target).map_err(to_string_error)?;
+    let mut target_auth = read_json::<serde_json::Value>(&auth_path)?;
+    let mut auth_changed = false;
+
+    if let Some(source_root) = source_auth_root.as_ref() {
+        let source_auth_path = source_root
+            .join("agents")
+            .join("main")
+            .join("agent")
+            .join("auth-profiles.json");
+        let source_auth = read_json::<serde_json::Value>(&source_auth_path)?;
+        auth_changed |= merge_auth_profiles(&mut target_auth, &source_auth);
+    }
+
+    auth_changed |= ensure_legacy_provider_aliases(
+        &mut target_auth,
+        &required_providers,
+        &preferred_auth_keys,
+    );
+
+    if auth_changed {
+        write_json(&auth_path, &target_auth)?;
+    }
+
+    Ok(())
+}
+
+fn merge_openclaw_auth_profiles(
+    target: &mut serde_json::Value,
+    source: &serde_json::Value,
+) -> bool {
+    let Some(source_profiles) = source
+        .get("auth")
+        .and_then(|item| item.get("profiles"))
+        .and_then(|item| item.as_object())
+    else {
+        return false;
+    };
+
+    let Some(target_object) = target.as_object_mut() else {
+        return false;
+    };
+    let Some(target_auth) = target_object
+        .entry("auth")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    let Some(target_profiles) = target_auth
+        .entry("profiles")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for (key, value) in source_profiles {
+        if !target_profiles.contains_key(key) {
+            target_profiles.insert(key.clone(), value.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn merge_auth_profiles(target: &mut serde_json::Value, source: &serde_json::Value) -> bool {
+    let Some(source_profiles) = source.get("profiles").and_then(|item| item.as_object()) else {
+        return false;
+    };
+    let Some(target_object) = target.as_object_mut() else {
+        return false;
+    };
+    let Some(target_profiles) = target_object
+        .entry("profiles")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for (key, value) in source_profiles {
+        if !target_profiles.contains_key(key) {
+            target_profiles.insert(key.clone(), value.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn openclaw_auth_profile_keys_by_provider(
+    config: &serde_json::Value,
+) -> HashMap<String, Vec<String>> {
+    let mut providers = HashMap::new();
+    let Some(profiles) = config
+        .get("auth")
+        .and_then(|item| item.get("profiles"))
+        .and_then(|item| item.as_object())
+    else {
+        return providers;
+    };
+
+    for (key, value) in profiles {
+        let Some(provider) = value
+            .get("provider")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        else {
+            continue;
+        };
+        providers
+            .entry(provider.to_string())
+            .or_insert_with(Vec::new)
+            .push(key.clone());
+    }
+
+    providers
+}
+
+fn ensure_legacy_provider_aliases(
+    auth_store: &mut serde_json::Value,
+    required_providers: &[String],
+    preferred_keys: &HashMap<String, Vec<String>>,
+) -> bool {
+    let Some(store_object) = auth_store.as_object_mut() else {
+        return false;
+    };
+    let Some(profiles) = store_object
+        .entry("profiles")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for provider in required_providers {
+        if provider != "minimax-cn" {
+            continue;
+        }
+        if profiles.values().any(|value| {
+            value.get("provider")
+                .and_then(|item| item.as_str())
+                .is_some_and(|item| item.trim() == "minimax-cn")
+        }) {
+            continue;
+        }
+
+        let legacy_profile = profiles.iter().find_map(|(key, value)| {
+            let provider_name = value
+                .get("provider")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            ((provider_name == "minimax") || key == "minimax:cn").then(|| value.clone())
+        });
+
+        let Some(mut profile) = legacy_profile else {
+            continue;
+        };
+        let Some(object) = profile.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "provider".into(),
+            serde_json::Value::String("minimax-cn".into()),
+        );
+
+        let preferred_key = preferred_keys
+            .get(provider)
+            .and_then(|keys| keys.iter().find(|key| !profiles.contains_key(*key)).cloned())
+            .unwrap_or_else(|| {
+                if profiles.contains_key("minimax-cn:default") {
+                    "minimax-cn:compat".to_string()
+                } else {
+                    "minimax-cn:default".to_string()
+                }
+            });
+        profiles.insert(preferred_key, profile);
+        changed = true;
+    }
+
+    changed
+}
+
+/*
+fn rewrite_managed_profile_gateway_port(
+    profile_root: &Path,
+    profile_id: &str,
+    gateway_port: u16,
+) -> Result<(), String> {
+    let config_path = profile_root.join("openclaw.json");
+    if !config_path.is_file() {
+        return Ok(());
+    }
+
+    let mut config = read_json::<serde_json::Value>(&config_path)?;
+    let gateway_token = format!("launcher-{}", profile_id.replace('-', ""));
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json 鏍煎紡鏃犳晥銆?.to_string())?;
+    let gateway = object
+        .entry("gateway")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json 涓殑 gateway 閰嶇疆鏃犳晥銆?.to_string())?;
+    gateway.insert(
+        "port".into(),
+        serde_json::Value::Number((gateway_port as u64).into()),
+    );
+    let auth = gateway
+        .entry("auth")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json 涓殑 gateway.auth 閰嶇疆鏃犳晥銆?.to_string())?;
+    auth.insert("mode".into(), serde_json::Value::String("token".into()));
+    auth.insert(
+        "token".into(),
+        serde_json::Value::String(gateway_token.clone()),
+    );
+    let remote = gateway
+        .entry("remote")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json 涓殑 gateway.remote 閰嶇疆鏃犳晥銆?.to_string())?;
+    remote.remove("mode");
+    remote.insert(
+        "url".into(),
+        serde_json::Value::String(format!("ws://127.0.0.1:{gateway_port}")),
+    );
+    remote.insert("token".into(), serde_json::Value::String(gateway_token));
+
+    write_json(&config_path, &config)?;
+    Ok(())
+}
+*/
+fn candidate_local_auth_roots(settings: Option<&AppSettings>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(configured) = settings
+        .and_then(|item| item.openclaw_data_dir.as_ref())
+        .map(PathBuf::from)
+        .filter(|path| looks_like_openclaw_data_dir(path))
+    {
+        seen.insert(configured.clone());
+        roots.push(configured);
+    }
+
+    if let Some(default_root) = default_openclaw_data_dir_path() {
+        if seen.insert(default_root.clone()) {
+            roots.push(default_root);
+        }
+    }
+
+    roots
+}
+
+fn rewrite_managed_profile_gateway_port(
+    profile_root: &Path,
+    profile_id: &str,
+    gateway_port: u16,
+) -> Result<(), String> {
+    let config_path = profile_root.join("openclaw.json");
+    if !config_path.is_file() {
+        return Ok(());
+    }
+
+    let mut config = read_json::<serde_json::Value>(&config_path)?;
+    let gateway_token = format!("launcher-{}", profile_id.replace('-', ""));
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json format is invalid.".to_string())?;
+    let gateway = object
+        .entry("gateway")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json gateway config is invalid.".to_string())?;
+    gateway.insert(
+        "port".into(),
+        serde_json::Value::Number((gateway_port as u64).into()),
+    );
+    let auth = gateway
+        .entry("auth")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json gateway.auth config is invalid.".to_string())?;
+    auth.insert("mode".into(), serde_json::Value::String("token".into()));
+    auth.insert(
+        "token".into(),
+        serde_json::Value::String(gateway_token.clone()),
+    );
+    let remote = gateway
+        .entry("remote")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "openclaw.json gateway.remote config is invalid.".to_string())?;
+    remote.remove("mode");
+    remote.insert(
+        "url".into(),
+        serde_json::Value::String(format!("ws://127.0.0.1:{gateway_port}")),
+    );
+    remote.insert("token".into(), serde_json::Value::String(gateway_token));
+
+    write_json(&config_path, &config)?;
     Ok(())
 }
 
@@ -3858,6 +4714,45 @@ fn managed_gateway_port(profile_id: &str) -> u16 {
         hash = hash.wrapping_mul(131).wrapping_add(byte as u32);
     }
     20000 + (hash % 20000) as u16
+}
+
+fn reassign_managed_gateway_port(launch_target: &LaunchTarget) -> Result<(), String> {
+    let profile_root = Path::new(&launch_target.profile_path);
+    let current_port = read_gateway_port(profile_root)
+        .map(|value| value as u16)
+        .unwrap_or_else(|| managed_gateway_port(&launch_target.profile_id));
+    let next_port = find_available_gateway_port(current_port)?;
+    rewrite_managed_profile_gateway_port(profile_root, &launch_target.profile_id, next_port)
+}
+
+fn find_available_gateway_port(start_port: u16) -> Result<u16, String> {
+    let start = if (20000..40000).contains(&start_port) {
+        start_port
+    } else {
+        20000
+    };
+
+    for offset in 1..=20000u16 {
+        let candidate = 20000 + ((start - 20000 + offset) % 20000);
+        if gateway_port_is_available(candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(if is_english_build() {
+        "No available local gateway port could be allocated for this craw.".to_string()
+    } else {
+        "无法为这只龙虾分配可用的本地 gateway 端口。".to_string()
+    })
+}
+
+fn gateway_port_is_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port))
+        .map(|listener| {
+            drop(listener);
+            true
+        })
+        .unwrap_or(false)
 }
 
 fn default_user_home() -> Option<PathBuf> {
@@ -4491,11 +5386,6 @@ fn display(path: &PathBuf) -> String {
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(to_string_error)?;
-    sha256_reader(&mut file)
 }
 
 fn sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
@@ -5348,25 +6238,49 @@ mod tests {
     use super::{
         apply_gateway_defaults, cli_profile_name_for, collect_cron_items,
         collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
+        replace_dashboard_child, stop_child_process,
         extract_agent_cli_text, gateway_config_for_target, infer_data_dir, linux_path_to_wsl_unc,
         normalize_openclaw_command_path, normalize_runtime_kind, resolve_direct_openclaw_cli,
-        is_valid_openclaw_command_path,
+        gateway_port_is_available, is_valid_openclaw_command_path, managed_gateway_port,
         localize_preview_json_times, sort_path_candidates,
         looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
         preview_cron_item, preview_setting_document_item, preview_skill_item, read_json,
-        schedule_summary_from_value, should_skip_export_path, validate_chat_runtime_for_target,
-        verify_import_package_impl, AppSettings, ExportProfileRequest, GatewayConfig, LaunchTarget,
-        PathCandidate, ValidationResult,
+        reassign_managed_gateway_port, schedule_summary_from_value, should_skip_export_path,
+        validate_chat_runtime_for_target, verify_import_package_impl, AppSettings, DashboardRuntime,
+        ExportProfileRequest, GatewayConfig, LaunchTarget, PathCandidate, ValidationResult,
     };
-    use std::{env, fs, fs::File};
+    use std::{env, fs, fs::File, io::Read, net::TcpListener, process::Command};
     use uuid::Uuid;
     use walkdir::WalkDir;
     use zip::ZipArchive;
+
+    fn spawn_long_running_process() -> std::process::Child {
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .unwrap()
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Command::new("sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .unwrap()
+        }
+    }
 
     #[test]
     fn export_defaults_skip_memory_and_account_paths() {
         assert!(should_skip_export_path(
             "agents/main/sessions/item.jsonl",
+            false,
+            false
+        ));
+        assert!(should_skip_export_path(
+            "cron/runs/job-1.jsonl",
             false,
             false
         ));
@@ -5485,6 +6399,7 @@ mod tests {
 
         fs::create_dir_all(source.join("agents/main/sessions")).unwrap();
         fs::create_dir_all(source.join("agents/main/agent")).unwrap();
+        fs::create_dir_all(source.join("cron/runs")).unwrap();
         fs::create_dir_all(source.join("devices")).unwrap();
         fs::create_dir_all(source.join("identity")).unwrap();
         fs::create_dir_all(source.join("workspace")).unwrap();
@@ -5492,6 +6407,7 @@ mod tests {
         fs::write(source.join("openclaw.json"), "{}").unwrap();
         fs::write(source.join("USER.md"), "private user profile").unwrap();
         fs::write(source.join("agents/main/sessions/history.jsonl"), "secret").unwrap();
+        fs::write(source.join("cron/runs/job-1.jsonl"), "secret").unwrap();
         fs::write(
             source.join("agents/main/agent/auth-profiles.json"),
             "secret",
@@ -5522,6 +6438,7 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name.contains("sessions/history.jsonl")));
+        assert!(!names.iter().any(|name| name.contains("cron/runs/job-1.jsonl")));
         assert!(!names.iter().any(|name| name == "USER.md"));
         assert!(!names.iter().any(|name| name.contains("auth-profiles.json")));
         assert!(!names
@@ -5803,7 +6720,8 @@ mod tests {
         )
         .unwrap();
 
-        normalize_managed_profile_runtime(&root, "12345678-aaaa-bbbb-cccc-abcdef123456").unwrap();
+        normalize_managed_profile_runtime(&root, "12345678-aaaa-bbbb-cccc-abcdef123456", None)
+            .unwrap();
         let config = read_json::<serde_json::Value>(&root.join("openclaw.json")).unwrap();
         assert_eq!(
             config
@@ -5811,6 +6729,261 @@ mod tests {
                 .and_then(|item| item.get("remote"))
                 .and_then(|item| item.get("mode")),
             None
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_sanitizes_openclaw_json_when_account_info_is_disabled() {
+        let root = env::temp_dir().join(format!("openclaw-export-config-test-{}", Uuid::new_v4()));
+        let source = root.join(".openclaw");
+        let zip_path = root.join("safe-export.claw");
+
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(
+            source.join("openclaw.json"),
+            serde_json::json!({
+                "auth": {
+                    "profiles": {
+                        "minimax-cn:default": {
+                            "provider": "minimax-cn",
+                            "apiKey": "top-secret"
+                        }
+                    }
+                },
+                "gateway": {
+                    "port": 18789,
+                    "auth": {
+                        "mode": "token",
+                        "token": "launcher-secret"
+                    },
+                    "remote": {
+                        "url": "ws://127.0.0.1:18789",
+                        "token": "remote-secret",
+                        "password": "remote-password"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        export_profile_impl(ExportProfileRequest {
+            source_dir: source.display().to_string(),
+            zip_path: Some(zip_path.display().to_string()),
+            package_name: Some("safe-export".into()),
+            include_memory: Some(false),
+            include_account_info: Some(false),
+        })
+        .unwrap();
+
+        let archive_file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(archive_file).unwrap();
+        let mut config_file = archive.by_name("openclaw.json").unwrap();
+        let mut content = String::new();
+        config_file.read_to_string(&mut content).unwrap();
+        let exported = serde_json::from_str::<serde_json::Value>(&content).unwrap();
+
+        assert!(exported.get("auth").is_none());
+        assert!(
+            exported
+                .get("gateway")
+                .and_then(|item| item.get("auth"))
+                .is_none()
+        );
+        assert!(
+            exported
+                .get("gateway")
+                .and_then(|item| item.get("remote"))
+                .and_then(|item| item.get("token"))
+                .is_none()
+        );
+        assert!(
+            exported
+                .get("gateway")
+                .and_then(|item| item.get("remote"))
+                .and_then(|item| item.get("password"))
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_managed_profile_runtime_copies_auth_from_configured_local_dir() {
+        let root = env::temp_dir().join(format!("openclaw-auth-bootstrap-test-{}", Uuid::new_v4()));
+        let local_data_dir = root.join("custom-local");
+        let managed_profile_dir = root.join("managed");
+        let auth_source = local_data_dir.join("agents/main/agent/auth-profiles.json");
+        let auth_target = managed_profile_dir.join("agents/main/agent/auth-profiles.json");
+
+        fs::create_dir_all(auth_source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&managed_profile_dir).unwrap();
+        fs::create_dir_all(local_data_dir.join("workspace")).unwrap();
+        fs::write(&auth_source, "{\"minimax-cn\":{\"apiKey\":\"test-key\"}}").unwrap();
+
+        let settings = AppSettings {
+            openclaw_data_dir: Some(local_data_dir.display().to_string()),
+            ..AppSettings::default()
+        };
+
+        normalize_managed_profile_runtime(
+            &managed_profile_dir,
+            "12345678-aaaa-bbbb-cccc-abcdef123456",
+            Some(&settings),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&auth_target).unwrap(),
+            "{\"minimax-cn\":{\"apiKey\":\"test-key\"}}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_managed_profile_runtime_merges_local_openclaw_auth_profiles() {
+        let root = env::temp_dir().join(format!("openclaw-auth-config-test-{}", Uuid::new_v4()));
+        let local_data_dir = root.join("custom-local");
+        let managed_profile_dir = root.join("managed");
+
+        fs::create_dir_all(&managed_profile_dir).unwrap();
+        fs::create_dir_all(local_data_dir.join("workspace")).unwrap();
+        fs::write(
+            local_data_dir.join("openclaw.json"),
+            serde_json::json!({
+                "auth": {
+                    "profiles": {
+                        "kimi:default": {
+                            "mode": "api_key",
+                            "provider": "kimi"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            managed_profile_dir.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "kimi/k2"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let settings = AppSettings {
+            openclaw_data_dir: Some(local_data_dir.display().to_string()),
+            ..AppSettings::default()
+        };
+
+        normalize_managed_profile_runtime(
+            &managed_profile_dir,
+            "12345678-aaaa-bbbb-cccc-abcdef123456",
+            Some(&settings),
+        )
+        .unwrap();
+
+        let config = read_json::<serde_json::Value>(&managed_profile_dir.join("openclaw.json")).unwrap();
+        assert_eq!(
+            config
+                .get("auth")
+                .and_then(|item| item.get("profiles"))
+                .and_then(|item| item.get("kimi:default"))
+                .and_then(|item| item.get("provider"))
+                .and_then(|item| item.as_str()),
+            Some("kimi")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_managed_profile_runtime_adds_minimax_cn_alias_from_legacy_auth() {
+        let root = env::temp_dir().join(format!("openclaw-auth-alias-test-{}", Uuid::new_v4()));
+        let local_data_dir = root.join("custom-local");
+        let managed_profile_dir = root.join("managed");
+        let auth_source = local_data_dir.join("agents/main/agent/auth-profiles.json");
+
+        fs::create_dir_all(auth_source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&managed_profile_dir).unwrap();
+        fs::create_dir_all(local_data_dir.join("workspace")).unwrap();
+        fs::write(
+            &auth_source,
+            serde_json::json!({
+                "version": 1,
+                "profiles": {
+                    "minimax:cn": {
+                        "type": "api_key",
+                        "provider": "minimax",
+                        "key": "legacy-key"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            managed_profile_dir.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "minimax-cn/MiniMax-M2.5-highspeed"
+                        }
+                    }
+                },
+                "auth": {
+                    "profiles": {
+                        "minimax-cn:default": {
+                            "mode": "api_key",
+                            "provider": "minimax-cn"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let settings = AppSettings {
+            openclaw_data_dir: Some(local_data_dir.display().to_string()),
+            ..AppSettings::default()
+        };
+
+        normalize_managed_profile_runtime(
+            &managed_profile_dir,
+            "12345678-aaaa-bbbb-cccc-abcdef123456",
+            Some(&settings),
+        )
+        .unwrap();
+
+        let auth = read_json::<serde_json::Value>(
+            &managed_profile_dir.join("agents/main/agent/auth-profiles.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            auth.get("profiles")
+                .and_then(|item| item.get("minimax-cn:default"))
+                .and_then(|item| item.get("provider"))
+                .and_then(|item| item.as_str()),
+            Some("minimax-cn")
+        );
+        assert_eq!(
+            auth.get("profiles")
+                .and_then(|item| item.get("minimax-cn:default"))
+                .and_then(|item| item.get("key"))
+                .and_then(|item| item.as_str()),
+            Some("legacy-key")
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -5931,11 +7104,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_chat_runtime_reports_missing_auth_for_imported_profile() {
+    fn validate_chat_runtime_allows_imported_profile_without_auth_precheck() {
         let root = env::temp_dir().join(format!("openclaw-chat-auth-test-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("workspace")).unwrap();
 
-        let error = validate_chat_runtime_for_target(&LaunchTarget {
+        validate_chat_runtime_for_target(&LaunchTarget {
             profile_id: "managed-profile-id".into(),
             profile_name: "Imported".into(),
             profile_path: root.display().to_string(),
@@ -5944,10 +7117,157 @@ mod tests {
             use_state_dir_env: false,
             managed_profile: None,
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("auth-profiles.json"));
+        let _ = fs::remove_dir_all(&root);
+    }
 
+    #[test]
+    fn validate_chat_runtime_allows_provider_mismatch_without_precheck() {
+        let root =
+            env::temp_dir().join(format!("openclaw-chat-provider-test-{}", Uuid::new_v4()));
+        let auth_dir = root.join("agents").join("main").join("agent");
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            root.join("openclaw.json"),
+            serde_json::json!({
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "minimax-cn/MiniMax-M2.5-highspeed"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            auth_dir.join("auth-profiles.json"),
+            serde_json::json!({
+                "profiles": {
+                    "moonshot-main": {
+                        "provider": "moonshot",
+                        "type": "api-key"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        validate_chat_runtime_for_target(&LaunchTarget {
+            profile_id: "managed-profile-id".into(),
+            profile_name: "Imported".into(),
+            profile_path: root.display().to_string(),
+            runtime_profile_path: root.display().to_string(),
+            cli_profile_name: Some("profile-managed".into()),
+            use_state_dir_env: false,
+            managed_profile: None,
+        })
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_child_process_terminates_running_process() {
+        let mut child = spawn_long_running_process();
+        stop_child_process(&mut child);
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn replace_dashboard_child_tracks_latest_process() {
+        let mut runtime = DashboardRuntime::default();
+        let first = spawn_long_running_process();
+        let first_pid = first.id();
+        replace_dashboard_child(&mut runtime, first, "first-profile".into());
+
+        let second = spawn_long_running_process();
+        let second_pid = second.id();
+        let tracked_pid = replace_dashboard_child(&mut runtime, second, "second-profile".into());
+
+        assert_eq!(tracked_pid, second_pid);
+        assert_eq!(runtime.profile_id.as_deref(), Some("second-profile"));
+        assert_eq!(runtime.child.as_ref().map(|child| child.id()), Some(second_pid));
+
+        let mut old_process_check = Command::new("powershell");
+        #[cfg(target_os = "windows")]
+        let old_process_exited = old_process_check
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "$p = Get-Process -Id {first_pid} -ErrorAction SilentlyContinue; if ($null -eq $p) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .unwrap()
+            .success();
+        #[cfg(not(target_os = "windows"))]
+        let old_process_exited = Command::new("sh")
+            .args(["-c", &format!("kill -0 {first_pid} >/dev/null 2>&1; test $? -ne 0")])
+            .status()
+            .unwrap()
+            .success();
+
+        assert!(old_process_exited);
+
+        if let Some(child) = runtime.child.as_mut() {
+            stop_child_process(child);
+        }
+    }
+
+    #[test]
+    fn reassign_managed_gateway_port_skips_occupied_port() {
+        let root =
+            env::temp_dir().join(format!("openclaw-gateway-reassign-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        let profile_id = "12345678-aaaa-bbbb-cccc-abcdef123456";
+        let occupied_port = managed_gateway_port(profile_id);
+        let listener = TcpListener::bind(("127.0.0.1", occupied_port)).unwrap();
+        fs::write(
+            root.join("openclaw.json"),
+            serde_json::json!({
+                "gateway": {
+                    "port": occupied_port,
+                    "auth": {
+                        "mode": "token",
+                        "token": "old-token"
+                    },
+                    "remote": {
+                        "url": format!("ws://127.0.0.1:{occupied_port}"),
+                        "token": "old-token"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        reassign_managed_gateway_port(&LaunchTarget {
+            profile_id: profile_id.into(),
+            profile_name: "Imported".into(),
+            profile_path: root.display().to_string(),
+            runtime_profile_path: root.display().to_string(),
+            cli_profile_name: Some("profile-managed".into()),
+            use_state_dir_env: false,
+            managed_profile: None,
+        })
+        .unwrap();
+
+        let config = read_json::<serde_json::Value>(&root.join("openclaw.json")).unwrap();
+        let new_port = config
+            .get("gateway")
+            .and_then(|item| item.get("port"))
+            .and_then(|item| item.as_u64())
+            .unwrap() as u16;
+        assert_ne!(new_port, occupied_port);
+        assert!(gateway_port_is_available(new_port));
+
+        drop(listener);
         let _ = fs::remove_dir_all(&root);
     }
 

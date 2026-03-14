@@ -50,6 +50,7 @@ export interface AppSettings {
   openclawDataDir?: string | null;
   runtimeTarget: RuntimeTargetConfig;
   profilesRoot?: string | null;
+  closeLaunchedProfilesOnExit: boolean;
   gatewayConfig: GatewayConfig;
   recentProfileId?: string | null;
   recentLaunches: LaunchRecord[];
@@ -133,6 +134,7 @@ export interface LaunchHandle {
 export interface GatewayStatus {
   mode: GatewayMode;
   url: string;
+  profileId?: string | null;
   running: boolean;
   pid?: number | null;
   startedAt?: string | null;
