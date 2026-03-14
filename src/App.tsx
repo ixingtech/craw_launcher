@@ -72,6 +72,7 @@ type ConfirmState = {
   details: string[];
   confirmLabel: string;
   cancelLabel: string;
+  showCancelButton: boolean;
   confirmTone: "primary" | "ghost";
   resolve?: (confirmed: boolean) => void;
 };
@@ -132,6 +133,7 @@ export default function App() {
     details: [],
     confirmLabel: t("confirm"),
     cancelLabel: t("cancel"),
+    showCancelButton: true,
     confirmTone: "primary"
   });
   const [exportState, setExportState] = useState<ExportState>({
@@ -460,7 +462,18 @@ export default function App() {
 
   const exportMutation = useMutation({
     mutationFn: (request: ExportProfileRequest) => api.exportProfile(request),
-    onSuccess: (result) => setStatus({ message: t("exportedLobsterPackageStatus", { path: result.zipPath }), tone: "success" }),
+    onSuccess: async (result) => {
+      setStatus({ message: t("exportedLobsterPackageStatus", { path: result.zipPath }), tone: "success" });
+      await openConfirmDialog({
+        title: t("exportSafetyReminderTitle"),
+        message: t("exportSafetyReminderMessage"),
+        details: [t("exportSafetyReminderDetail1"), t("exportSafetyReminderDetail2")],
+        confirmLabel: t("close"),
+        cancelLabel: t("close"),
+        showCancelButton: false,
+        confirmTone: "ghost"
+      });
+    },
     onError: (error) => setStatus({ message: readableError(error, t("exportLobsterPackageFailed")), tone: "error" })
   });
 
@@ -706,6 +719,7 @@ export default function App() {
     details = [],
     confirmLabel = t("confirm"),
     cancelLabel = t("cancel"),
+    showCancelButton = true,
     confirmTone = "primary"
   }: {
     title?: string;
@@ -713,6 +727,7 @@ export default function App() {
     details?: string[];
     confirmLabel?: string;
     cancelLabel?: string;
+    showCancelButton?: boolean;
     confirmTone?: "primary" | "ghost";
   }) =>
     new Promise<boolean>((resolve) => {
@@ -723,6 +738,7 @@ export default function App() {
         details,
         confirmLabel,
         cancelLabel,
+        showCancelButton,
         confirmTone,
         resolve
       });
@@ -738,6 +754,7 @@ export default function App() {
         details: [],
         confirmLabel: t("confirm"),
         cancelLabel: t("cancel"),
+        showCancelButton: true,
         confirmTone: "primary"
       };
     });
@@ -1152,7 +1169,7 @@ function PreviewDialog({ state, onClose }: { state: PreviewState; onClose: () =>
 }
 
 function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: (confirmed: boolean) => void }) {
-  return <div className="modal-backdrop"><div className="modal-card confirm-modal"><div className="panel-header"><div><h3>{state.title}</h3><p className="muted confirm-message">{state.message}</p></div><button className="button ghost" onClick={() => onClose(false)}>{state.cancelLabel}</button></div>{state.details.length ? <div className="confirm-detail-list">{state.details.map((detail) => <div key={detail} className="confirm-detail-item">{detail}</div>)}</div> : null}<div className="button-row wrap"><button className={`button ${state.confirmTone}`} onClick={() => onClose(true)}>{state.confirmLabel}</button></div></div></div>;
+  return <div className="modal-backdrop"><div className="modal-card confirm-modal"><div className="panel-header"><div><h3>{state.title}</h3><p className="muted confirm-message">{state.message}</p></div>{state.showCancelButton ? <button className="button ghost" onClick={() => onClose(false)}>{state.cancelLabel}</button> : null}</div>{state.details.length ? <div className="confirm-detail-list">{state.details.map((detail) => <div key={detail} className="confirm-detail-item">{detail}</div>)}</div> : null}<div className="button-row wrap"><button className={`button ${state.confirmTone}`} onClick={() => onClose(true)}>{state.confirmLabel}</button></div></div></div>;
 }
 
 function Field({ label, value }: { label: string; value: string }) {

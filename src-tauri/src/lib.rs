@@ -2287,6 +2287,10 @@ fn should_skip_export_path(
         return false;
     }
 
+    if is_runtime_export_path(normalized) {
+        return true;
+    }
+
     if !include_memory && is_history_export_path(normalized) {
         return true;
     }
@@ -2301,6 +2305,21 @@ fn should_skip_export_path(
     }
 
     false
+}
+
+fn is_runtime_export_path(normalized_path: &str) -> bool {
+    let normalized = normalized_path.to_ascii_lowercase();
+    normalized == PROFILE_META_FILE
+        || normalized == "update-check.json"
+        || normalized == "gateway.cmd"
+        || normalized == "gateway.bat"
+        || normalized == "gateway.exe"
+        || normalized == "browser/openclaw/user-data"
+        || normalized.starts_with("browser/openclaw/user-data/")
+        || normalized == "logs"
+        || normalized.starts_with("logs/")
+        || normalized == "openclaw.json.bak"
+        || normalized.starts_with("openclaw.json.bak.")
 }
 
 fn is_history_export_path(normalized_path: &str) -> bool {
@@ -4246,6 +4265,7 @@ fn normalize_managed_profile_runtime(
             "token".into(),
             serde_json::Value::String(format!("launcher-{}", profile_id.replace('-', ""))),
         );
+        sanitize_portable_plugin_config(object, profile_root);
 
         write_json(&config_path, &config)?;
     }
@@ -4253,6 +4273,81 @@ fn normalize_managed_profile_runtime(
     bootstrap_managed_auth(profile_root, settings)?;
     merge_managed_profile_auth_settings(profile_root, settings)?;
     Ok(())
+}
+
+fn plugin_path_is_portable(path: &str, profile_root: &Path) -> bool {
+    let candidate = Path::new(path);
+    !candidate.is_absolute() || candidate.starts_with(profile_root)
+}
+
+fn sanitize_portable_plugin_config(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    profile_root: &Path,
+) -> bool {
+    let Some(plugins) = root.get_mut("plugins").and_then(|item| item.as_object_mut()) else {
+        return false;
+    };
+
+    let mut changed = false;
+
+    if let Some(load) = plugins.get_mut("load").and_then(|item| item.as_object_mut()) {
+        let mut remove_paths = false;
+        if let Some(paths) = load.get_mut("paths").and_then(|item| item.as_array_mut()) {
+            let original_len = paths.len();
+            paths.retain(|item| {
+                item.as_str()
+                    .is_some_and(|path| plugin_path_is_portable(path, profile_root))
+            });
+            changed |= paths.len() != original_len;
+            remove_paths = paths.is_empty();
+        }
+        if remove_paths {
+            load.remove("paths");
+            changed = true;
+        }
+        if load.is_empty() {
+            plugins.remove("load");
+            changed = true;
+        }
+    }
+
+    if let Some(installs) = plugins.get_mut("installs").and_then(|item| item.as_object_mut()) {
+        let keys = installs.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let Some(entry) = installs.get_mut(&key).and_then(|item| item.as_object_mut()) else {
+                continue;
+            };
+
+            for field in ["installPath", "sourcePath"] {
+                let should_remove = entry
+                    .get(field)
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|path| !plugin_path_is_portable(path, profile_root));
+                if should_remove {
+                    entry.remove(field);
+                    changed = true;
+                }
+            }
+
+            let remove_install = entry
+                .get("source")
+                .and_then(|item| item.as_str())
+                .is_some_and(|source| source == "path")
+                && !entry.contains_key("installPath")
+                && !entry.contains_key("sourcePath");
+            if remove_install {
+                installs.remove(&key);
+                changed = true;
+            }
+        }
+
+        if installs.is_empty() {
+            plugins.remove("installs");
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn bootstrap_managed_auth(profile_root: &Path, settings: Option<&AppSettings>) -> Result<(), String> {
@@ -6244,6 +6339,7 @@ mod tests {
         gateway_port_is_available, is_valid_openclaw_command_path, managed_gateway_port,
         localize_preview_json_times, sort_path_candidates,
         looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
+        PROFILE_META_FILE,
         preview_cron_item, preview_setting_document_item, preview_skill_item, read_json,
         reassign_managed_gateway_port, schedule_summary_from_value, should_skip_export_path,
         validate_chat_runtime_for_target, verify_import_package_impl, AppSettings, DashboardRuntime,
@@ -6295,6 +6391,16 @@ mod tests {
             false,
             false
         ));
+        assert!(should_skip_export_path(".openclaw-profile.json", false, false));
+        assert!(should_skip_export_path("gateway.cmd", false, false));
+        assert!(should_skip_export_path("update-check.json", false, false));
+        assert!(should_skip_export_path("openclaw.json.bak.1", false, false));
+        assert!(should_skip_export_path(
+            "browser/openclaw/user-data/Default/Preferences",
+            false,
+            false
+        ));
+        assert!(should_skip_export_path("logs/app.log", false, false));
         assert!(!should_skip_export_path(
             "workspace/project.txt",
             false,
@@ -6400,14 +6506,26 @@ mod tests {
         fs::create_dir_all(source.join("agents/main/sessions")).unwrap();
         fs::create_dir_all(source.join("agents/main/agent")).unwrap();
         fs::create_dir_all(source.join("cron/runs")).unwrap();
+        fs::create_dir_all(source.join("browser/openclaw/user-data/Default")).unwrap();
         fs::create_dir_all(source.join("devices")).unwrap();
         fs::create_dir_all(source.join("identity")).unwrap();
+        fs::create_dir_all(source.join("logs")).unwrap();
         fs::create_dir_all(source.join("workspace")).unwrap();
 
         fs::write(source.join("openclaw.json"), "{}").unwrap();
+        fs::write(source.join(PROFILE_META_FILE), "{}").unwrap();
         fs::write(source.join("USER.md"), "private user profile").unwrap();
         fs::write(source.join("agents/main/sessions/history.jsonl"), "secret").unwrap();
         fs::write(source.join("cron/runs/job-1.jsonl"), "secret").unwrap();
+        fs::write(source.join("gateway.cmd"), "secret").unwrap();
+        fs::write(source.join("update-check.json"), "secret").unwrap();
+        fs::write(source.join("openclaw.json.bak.1"), "secret").unwrap();
+        fs::write(
+            source.join("browser/openclaw/user-data/Default/Preferences"),
+            "secret",
+        )
+        .unwrap();
+        fs::write(source.join("logs/runtime.log"), "secret").unwrap();
         fs::write(
             source.join("agents/main/agent/auth-profiles.json"),
             "secret",
@@ -6440,6 +6558,14 @@ mod tests {
             .any(|name| name.contains("sessions/history.jsonl")));
         assert!(!names.iter().any(|name| name.contains("cron/runs/job-1.jsonl")));
         assert!(!names.iter().any(|name| name == "USER.md"));
+        assert!(!names.iter().any(|name| name == PROFILE_META_FILE));
+        assert!(!names.iter().any(|name| name == "gateway.cmd"));
+        assert!(!names.iter().any(|name| name == "update-check.json"));
+        assert!(!names.iter().any(|name| name == "openclaw.json.bak.1"));
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("browser/openclaw/user-data/Default/Preferences")));
+        assert!(!names.iter().any(|name| name.contains("logs/runtime.log")));
         assert!(!names.iter().any(|name| name.contains("auth-profiles.json")));
         assert!(!names
             .iter()
@@ -6729,6 +6855,65 @@ mod tests {
                 .and_then(|item| item.get("remote"))
                 .and_then(|item| item.get("mode")),
             None
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_managed_profile_runtime_removes_external_plugin_paths() {
+        let root = env::temp_dir().join(format!("openclaw-plugin-sanitize-test-{}", Uuid::new_v4()));
+        let managed_profile_dir = root.join("managed");
+        fs::create_dir_all(&managed_profile_dir).unwrap();
+        fs::write(
+            managed_profile_dir.join("openclaw.json"),
+            serde_json::json!({
+                "plugins": {
+                    "load": {
+                        "paths": [
+                            "C:\\Users\\18072\\openclaw-china\\packages\\channels",
+                            managed_profile_dir.join("plugins").display().to_string()
+                        ]
+                    },
+                    "installs": {
+                        "channels": {
+                            "source": "path",
+                            "installPath": "C:\\Users\\18072\\openclaw-china\\packages\\channels",
+                            "sourcePath": "C:\\Users\\18072\\openclaw-china\\packages\\channels"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        normalize_managed_profile_runtime(
+            &managed_profile_dir,
+            "12345678-aaaa-bbbb-cccc-abcdef123456",
+            None,
+        )
+        .unwrap();
+
+        let config = read_json::<serde_json::Value>(&managed_profile_dir.join("openclaw.json")).unwrap();
+        let load_paths = config
+            .get("plugins")
+            .and_then(|item| item.get("load"))
+            .and_then(|item| item.get("paths"))
+            .and_then(|item| item.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(load_paths.len(), 1);
+        assert_eq!(
+            load_paths[0].as_str(),
+            Some(managed_profile_dir.join("plugins").display().to_string().as_str())
+        );
+        assert!(
+            config
+                .get("plugins")
+                .and_then(|item| item.get("installs"))
+                .and_then(|item| item.get("channels"))
+                .is_none()
         );
 
         let _ = fs::remove_dir_all(&root);
