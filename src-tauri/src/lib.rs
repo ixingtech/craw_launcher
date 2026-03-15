@@ -2650,6 +2650,11 @@ fn windows_terminal_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn windows_batch_escape(value: &str) -> String {
+    value.replace('%', "%%").replace('"', "\"\"")
+}
+
+#[cfg(test)]
 fn build_windows_terminal_command_line(
     executable_path: &str,
     args: &[String],
@@ -2663,18 +2668,86 @@ fn build_windows_terminal_command_line(
         .chain(args.iter().map(|arg| windows_terminal_quote(arg)))
         .collect::<Vec<_>>()
         .join(" ");
-    segments.push(invocation);
+    let terminal_invocation = if Path::new(executable_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
+    {
+        format!("call {invocation}")
+    } else {
+        invocation
+    };
+    segments.push(terminal_invocation);
     segments.join(" && ")
 }
 
-fn spawn_windows_terminal(command_line: &str, working_dir: Option<&str>) -> Result<(), String> {
-    let mut command = Command::new("cmd.exe");
+fn build_windows_terminal_script(
+    executable_path: &str,
+    args: &[String],
+    envs: &[(String, String)],
+    working_dir: Option<&str>,
+) -> String {
+    let mut lines = vec!["@echo off".to_string(), "setlocal".to_string()];
     if let Some(dir) = working_dir.filter(|value| !value.trim().is_empty()) {
-        command.current_dir(dir);
+        lines.push(format!(
+            "cd /d {}",
+            windows_terminal_quote(&windows_batch_escape(dir))
+        ));
     }
-    command
+    for (key, value) in envs {
+        lines.push(format!(
+            "set \"{key}={}\"",
+            windows_batch_escape(value)
+        ));
+    }
+    let invocation = std::iter::once(windows_terminal_quote(&windows_batch_escape(executable_path)))
+        .chain(
+            args.iter()
+                .map(|arg| windows_terminal_quote(&windows_batch_escape(arg))),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let terminal_invocation = if Path::new(executable_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
+    {
+        format!("call {invocation}")
+    } else {
+        invocation
+    };
+    lines.push(terminal_invocation);
+    lines.push("set \"OPENCLAW_LAUNCH_EXIT=%ERRORLEVEL%\"".to_string());
+    lines.push("if not \"%OPENCLAW_LAUNCH_EXIT%\"==\"0\" echo.".to_string());
+    lines.push(
+        "if not \"%OPENCLAW_LAUNCH_EXIT%\"==\"0\" echo Command failed with exit code %OPENCLAW_LAUNCH_EXIT%."
+            .to_string(),
+    );
+    lines.push("endlocal".to_string());
+    lines.join("\r\n")
+}
+
+fn write_windows_terminal_script(
+    executable_path: &str,
+    args: &[String],
+    envs: &[(String, String)],
+    working_dir: Option<&str>,
+) -> Result<PathBuf, String> {
+    let dir = env::temp_dir().join("openclaw-launcher-terminal");
+    fs::create_dir_all(&dir).map_err(to_string_error)?;
+    let script_path = dir.join(format!("openclaw-terminal-{}.cmd", Uuid::new_v4()));
+    fs::write(
+        &script_path,
+        build_windows_terminal_script(executable_path, args, envs, working_dir),
+    )
+    .map_err(to_string_error)?;
+    Ok(script_path)
+}
+
+fn spawn_windows_terminal_script(script_path: &Path) -> Result<(), String> {
+    Command::new("cmd.exe")
         .arg("/K")
-        .arg(command_line)
+        .arg(script_path)
         .spawn()
         .map_err(to_string_error)?;
     Ok(())
@@ -2683,14 +2756,75 @@ fn spawn_windows_terminal(command_line: &str, working_dir: Option<&str>) -> Resu
 fn resolve_windows_terminal_command(
     executable_path: &Path,
 ) -> Result<(String, Vec<String>), String> {
-    if let Some((node_path, cli_entry)) = resolve_direct_openclaw_cli(executable_path)? {
-        return Ok((
-            display_path(&node_path),
-            vec![display_path(&cli_entry)],
+    Ok((display_path(executable_path), Vec::new()))
+}
+
+fn runtime_openclaw_working_dir(runtime_target: &ResolvedRuntimeTarget) -> Option<String> {
+    if runtime_target.is_wsl() {
+        return linux_parent_dir(&runtime_target.executable_path);
+    }
+
+    Path::new(&runtime_target.executable_path)
+        .parent()
+        .map(display_path)
+}
+
+fn runtime_command_supports_subcommand(
+    runtime_target: &ResolvedRuntimeTarget,
+    subcommand: &str,
+) -> bool {
+    let args = vec![subcommand.to_string(), "--help".to_string()];
+    let working_dir = runtime_openclaw_working_dir(runtime_target);
+    let Ok(mut command) =
+        build_runtime_openclaw_command(runtime_target, &args, &[], working_dir.as_deref())
+    else {
+        return false;
+    };
+
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn build_lobster_terminal_launch(
+    launch_target: &LaunchTarget,
+    gateway_config: &GatewayConfig,
+    use_tui: bool,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut args = Vec::new();
+    if let Some(profile_name) = launch_target.cli_profile_name.clone() {
+        args.push("--profile".to_string());
+        args.push(profile_name);
+    }
+
+    let mut envs = Vec::new();
+    if launch_target.use_state_dir_env {
+        envs.push((
+            "OPENCLAW_STATE_DIR".to_string(),
+            launch_target.runtime_profile_path.clone(),
         ));
     }
 
-    Ok((display_path(executable_path), Vec::new()))
+    if use_tui {
+        args.push("tui".to_string());
+        args.push("--url".to_string());
+        args.push(to_gateway_ws_url(&gateway_config.url));
+        if let Some((mode, secret)) = read_gateway_auth_secret(Path::new(&launch_target.profile_path))
+        {
+            if mode == "token" {
+                args.push("--token".to_string());
+                args.push(secret);
+            } else if mode == "password" {
+                args.push("--password".to_string());
+                args.push(secret);
+            }
+        }
+    }
+
+    (args, envs)
 }
 
 fn open_control_web_impl(
@@ -4382,32 +4516,27 @@ fn open_lobster_terminal_impl(app: AppHandle, profile_id: String) -> Result<(), 
     let settings = load_settings(app.clone())?;
     let runtime_target = resolve_runtime_target(&settings)?;
     let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
-
-    let mut args = Vec::new();
-    if let Some(profile_name) = launch_target.cli_profile_name.clone() {
-        args.push("--profile".to_string());
-        args.push(profile_name);
-    }
-
-    let mut envs = Vec::new();
-    if launch_target.use_state_dir_env {
-        envs.push((
-            "OPENCLAW_STATE_DIR".to_string(),
-            launch_target.runtime_profile_path.clone(),
-        ));
-    }
+    let runtime_state = app.state::<RuntimeState>();
+    let gateway_config = if runtime_target.is_wsl() {
+        ensure_target_gateway_running_with_runtime(&runtime_state, &runtime_target, &launch_target)?
+    } else {
+        let executable_path = PathBuf::from(&runtime_target.executable_path);
+        ensure_target_gateway_running(&runtime_state, &executable_path, &launch_target)?
+    };
+    let supports_tui = runtime_command_supports_subcommand(&runtime_target, "tui");
+    let (args, envs) = build_lobster_terminal_launch(&launch_target, &gateway_config, supports_tui);
+    let working_dir = runtime_openclaw_working_dir(&runtime_target);
 
     if runtime_target.is_wsl() {
         let distro = runtime_target
             .wsl_distro
             .as_ref()
             .ok_or_else(|| "Missing WSL distro".to_string())?;
-        let current_dir = linux_parent_dir(&runtime_target.executable_path);
         let mut script = build_wsl_script(
             &runtime_target.executable_path,
             &args,
             &envs,
-            current_dir.as_deref(),
+            working_dir.as_deref(),
         );
         if script.trim().is_empty() {
             script = "exec bash".to_string();
@@ -4433,11 +4562,15 @@ fn open_lobster_terminal_impl(app: AppHandle, profile_id: String) -> Result<(), 
     }
 
     let executable_path = PathBuf::from(&runtime_target.executable_path);
-    let working_dir = executable_path.parent().map(display_path);
     let (command_path, mut command_args) = resolve_windows_terminal_command(&executable_path)?;
     command_args.extend(args);
-    let command_line = build_windows_terminal_command_line(&command_path, &command_args, &envs);
-    spawn_windows_terminal(&command_line, working_dir.as_deref())
+    let script_path = write_windows_terminal_script(
+        &command_path,
+        &command_args,
+        &envs,
+        working_dir.as_deref(),
+    )?;
+    spawn_windows_terminal_script(&script_path)
 }
 
 fn merge_managed_profile_auth_settings(
@@ -6331,11 +6464,13 @@ fn localize_preview_json_times(value: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_gateway_defaults, cli_profile_name_for, collect_cron_items,
+        apply_gateway_defaults, build_lobster_terminal_launch, build_windows_terminal_command_line,
+        build_windows_terminal_script, cli_profile_name_for, collect_cron_items,
         collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
         replace_dashboard_child, stop_child_process,
         extract_agent_cli_text, gateway_config_for_target, infer_data_dir, linux_path_to_wsl_unc,
         normalize_openclaw_command_path, normalize_runtime_kind, resolve_direct_openclaw_cli,
+        resolve_windows_terminal_command,
         gateway_port_is_available, is_valid_openclaw_command_path, managed_gateway_port,
         localize_preview_json_times, sort_path_candidates,
         looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
@@ -6656,6 +6791,125 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lobster_terminal_launch_uses_tui_with_gateway_context() {
+        let root = env::temp_dir().join(format!("openclaw-terminal-tui-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::write(
+            root.join("openclaw.json"),
+            serde_json::json!({
+                "gateway": {
+                    "port": 18789,
+                    "auth": {
+                        "mode": "token",
+                        "token": "test-token"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (args, envs) = build_lobster_terminal_launch(
+            &LaunchTarget {
+                profile_id: "__local__".into(),
+                profile_name: "Local".into(),
+                profile_path: root.display().to_string(),
+                runtime_profile_path: "/home/demo/.openclaw".into(),
+                cli_profile_name: None,
+                use_state_dir_env: true,
+                managed_profile: None,
+            },
+            &GatewayConfig {
+                mode: "auto".into(),
+                command: None,
+                args: Vec::new(),
+                url: "http://127.0.0.1:18789".into(),
+                health_endpoint: "/health".into(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "tui".to_string(),
+                "--url".to_string(),
+                "ws://127.0.0.1:18789".to_string(),
+                "--token".to_string(),
+                "test-token".to_string()
+            ]
+        );
+        assert_eq!(
+            envs,
+            vec![(
+                "OPENCLAW_STATE_DIR".to_string(),
+                "/home/demo/.openclaw".to_string()
+            )]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lobster_terminal_launch_falls_back_to_profile_context_without_tui() {
+        let (args, envs) = build_lobster_terminal_launch(
+            &LaunchTarget {
+                profile_id: "managed".into(),
+                profile_name: "Managed".into(),
+                profile_path: "C:\\managed".into(),
+                runtime_profile_path: "C:\\managed".into(),
+                cli_profile_name: Some("profile-managed".into()),
+                use_state_dir_env: false,
+                managed_profile: None,
+            },
+            &GatewayConfig {
+                mode: "auto".into(),
+                command: None,
+                args: Vec::new(),
+                url: "http://127.0.0.1:18789".into(),
+                health_endpoint: "/health".into(),
+            },
+            false,
+        );
+
+        assert_eq!(
+            args,
+            vec!["--profile".to_string(), "profile-managed".to_string()]
+        );
+        assert!(envs.is_empty());
+    }
+
+    #[test]
+    fn build_windows_terminal_command_line_uses_call_for_cmd_shim() {
+        let line = build_windows_terminal_command_line(
+            r"C:\Users\demo\AppData\Roaming\npm\openclaw.cmd",
+            &["tui".to_string()],
+            &[],
+        );
+
+        assert_eq!(
+            line,
+            r#"call "C:\Users\demo\AppData\Roaming\npm\openclaw.cmd" "tui""#
+        );
+    }
+
+    #[test]
+    fn build_windows_terminal_script_wraps_command_in_batch_file() {
+        let script = build_windows_terminal_script(
+            r"C:\Users\demo\AppData\Roaming\npm\openclaw.cmd",
+            &["tui".to_string(), "--url".to_string(), "ws://127.0.0.1:18789".to_string()],
+            &[("OPENCLAW_STATE_DIR".to_string(), r"C:\demo\.openclaw".to_string())],
+            Some(r"C:\Users\demo\AppData\Roaming\npm"),
+        );
+
+        assert!(script.contains(r#"cd /d "C:\Users\demo\AppData\Roaming\npm""#));
+        assert!(script.contains(r#"set "OPENCLAW_STATE_DIR=C:\demo\.openclaw""#));
+        assert!(script.contains(
+            r#"call "C:\Users\demo\AppData\Roaming\npm\openclaw.cmd" "tui" "--url" "ws://127.0.0.1:18789""#
+        ));
     }
 
     #[test]
@@ -7548,6 +7802,22 @@ mod tests {
             .expect("expected npm shim to resolve");
         assert_eq!(resolved_node, bundled_node);
         assert_eq!(resolved_entry, cli_entry);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_windows_terminal_command_keeps_cmd_shim_for_interactive_terminal() {
+        let root =
+            env::temp_dir().join(format!("openclaw-terminal-shim-test-{}", Uuid::new_v4()));
+        let executable = root.join("openclaw.cmd");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&executable, b"@echo off\r\n").unwrap();
+
+        let (command_path, command_args) = resolve_windows_terminal_command(&executable).unwrap();
+
+        assert_eq!(command_path, executable.display().to_string());
+        assert!(command_args.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }

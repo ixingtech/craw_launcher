@@ -9,7 +9,8 @@ if (!locale) {
 
 const bundleDir = path.resolve("src-tauri", "target", "release", "bundle", "nsis");
 const releaseDir = path.resolve("src-tauri", "target", "release");
-const VERSION = "0.1.8";
+const packageJsonPath = path.resolve("package.json");
+const VERSION = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")).version;
 
 const artifactConfig = {
   "zh-CN": {

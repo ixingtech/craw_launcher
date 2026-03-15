@@ -27,7 +27,7 @@ import type {
 } from "./lib/types";
 
 const LOCAL_PROFILE_ID = "__local__";
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.9";
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 const DEFAULT_OPENCLAW_PATH = IS_MAC ? "~/.openclaw" : `C:\\Users\\${isEnglish ? "your-name" : "你的用户名"}\\.openclaw`;
 const DEFAULT_EXECUTABLE_PATH = IS_MAC
