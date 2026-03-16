@@ -1,6 +1,6 @@
 [package]
 name = "openclaw_launcher"
-version = "0.1.9"
+version = "0.1.10"
 description = "OpenClaw profile and gateway launcher"
 authors = ["Codex"]
 edition = "2021"

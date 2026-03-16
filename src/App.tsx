@@ -1,4 +1,5 @@
 ﻿import { useEffect, useMemo, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -27,8 +28,9 @@ import type {
 } from "./lib/types";
 
 const LOCAL_PROFILE_ID = "__local__";
-const APP_VERSION = "0.1.9";
+const APP_VERSION = "0.1.10";
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
+const IS_TAURI = isTauri();
 const DEFAULT_OPENCLAW_PATH = IS_MAC ? "~/.openclaw" : `C:\\Users\\${isEnglish ? "your-name" : "你的用户名"}\\.openclaw`;
 const DEFAULT_EXECUTABLE_PATH = IS_MAC
   ? "/Applications/OpenClaw.app/Contents/MacOS/OpenClaw"
@@ -97,14 +99,47 @@ const defaultSettings: AppSettings = {
     url: "http://127.0.0.1:18789",
     healthEndpoint: "/health"
   },
-  recentProfileId: "",
+  recentProfileId: null,
+  recentProfileIdWindows: null,
+  recentProfileIdWsl: null,
   recentLaunches: []
 };
 
+function buildRuntimeScope(settings?: AppSettings | null) {
+  if (!settings) {
+    return "windows::";
+  }
+  if (settings.runtimeTarget.kind === "wsl") {
+    return [
+      "wsl",
+      settings.runtimeTarget.wslDistro || "",
+      settings.runtimeTarget.wslDataDir || "",
+      settings.runtimeTarget.wslOpenclawPath || ""
+    ].join("::");
+  }
+  return [
+    "windows",
+    settings.openclawDataDir || "",
+    settings.openclawExecutablePath || ""
+  ].join("::");
+}
+
 export default function App() {
   const queryClient = useQueryClient();
-  const store = useAppStore();
-  const needsProfiles = store.page === "profiles" || store.page === "chat" || store.page === "notifications" || store.page === "docs";
+  const page = useAppStore((state) => state.page);
+  const activeProfileId = useAppStore((state) => state.activeProfileId);
+  const viewingProfileId = useAppStore((state) => state.viewingProfileId);
+  const selectedConversationId = useAppStore((state) => state.selectedConversationId);
+  const streamingBuffer = useAppStore((state) => state.streamingBuffer);
+  const waitingConversations = useAppStore((state) => state.waitingConversations);
+  const setPage = useAppStore((state) => state.setPage);
+  const setActiveProfileId = useAppStore((state) => state.setActiveProfileId);
+  const setViewingProfileId = useAppStore((state) => state.setViewingProfileId);
+  const setSelectedConversationId = useAppStore((state) => state.setSelectedConversationId);
+  const appendStreamingChunk = useAppStore((state) => state.appendStreamingChunk);
+  const setWaitingConversation = useAppStore((state) => state.setWaitingConversation);
+  const clearStreamingConversation = useAppStore((state) => state.clearStreamingConversation);
+  const needsProfiles = page === "profiles" || page === "chat" || page === "notifications" || page === "docs";
   const [autoDetectionAttempted, setAutoDetectionAttempted] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(defaultSettings);
   const [chatDraft, setChatDraft] = useState("");
@@ -116,6 +151,7 @@ export default function App() {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [launchingState, setLaunchingState] = useState<LaunchingState | null>(null);
+  const [lastRuntimeScope, setLastRuntimeScope] = useState("");
   const [docDraft, setDocDraft] = useState("");
   const [docEditing, setDocEditing] = useState(false);
   const [previewState, setPreviewState] = useState<PreviewState>({
@@ -145,11 +181,11 @@ export default function App() {
     includeAccountInfo: false
   });
   const shouldPollGateway =
-    store.page === "overview" ||
-    store.page === "chat" ||
-    store.page === "notifications" ||
-    store.page === "profiles" ||
-    store.page === "docs";
+    page === "overview" ||
+    page === "chat" ||
+    page === "notifications" ||
+    page === "profiles" ||
+    page === "docs";
 
   const settingsQuery = useQuery({
     queryKey: ["settings"],
@@ -157,6 +193,7 @@ export default function App() {
     staleTime: 30000,
     refetchOnWindowFocus: false
   });
+  const runtimeScope = useMemo(() => buildRuntimeScope(settingsQuery.data), [settingsQuery.data]);
   const desktopPathQuery = useQuery({
     queryKey: ["desktop-path"],
     queryFn: api.desktopPath,
@@ -169,7 +206,7 @@ export default function App() {
     staleTime: 30000
   });
   const profilesQuery = useQuery({
-    queryKey: ["profiles"],
+    queryKey: ["profiles", runtimeScope],
     queryFn: api.listProfiles,
     enabled: needsProfiles,
     staleTime: 30000
@@ -177,7 +214,7 @@ export default function App() {
   const conversationSummariesQuery = useQuery({
     queryKey: ["conversation-summaries"],
     queryFn: api.listConversationSummaries,
-    enabled: store.page === "chat",
+    enabled: page === "chat",
     staleTime: 30000
   });
   const gatewayQuery = useQuery({
@@ -189,15 +226,15 @@ export default function App() {
     staleTime: 15000
   });
   const inventoryQuery = useQuery({
-    queryKey: ["profile-inventory", store.viewingProfileId || LOCAL_PROFILE_ID],
-    queryFn: () => api.inspectProfile(store.viewingProfileId || LOCAL_PROFILE_ID),
-    enabled: store.page === "profiles"
+    queryKey: ["profile-inventory", runtimeScope, viewingProfileId || LOCAL_PROFILE_ID],
+    queryFn: () => api.inspectProfile(viewingProfileId || LOCAL_PROFILE_ID),
+    enabled: page === "profiles"
   });
   const readmeQuery = useQuery({
-    queryKey: ["profile-readme", store.viewingProfileId || store.activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID],
+    queryKey: ["profile-readme", runtimeScope, viewingProfileId || activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID],
     queryFn: () =>
-      api.readProfileReadme(store.viewingProfileId || store.activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID),
-    enabled: store.page === "docs"
+      api.readProfileReadme(viewingProfileId || activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID),
+    enabled: page === "docs"
   });
 
   useEffect(() => {
@@ -205,6 +242,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!IS_TAURI) {
+      setCurrentVersion(APP_VERSION);
+      return;
+    }
     void getVersion().then(setCurrentVersion).catch(() => setCurrentVersion(""));
   }, []);
 
@@ -229,6 +270,22 @@ export default function App() {
   }, [settingsQuery.data]);
 
   useEffect(() => {
+    if (!runtimeScope) {
+      return;
+    }
+    if (lastRuntimeScope && lastRuntimeScope !== runtimeScope) {
+      const nextProfileId = settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID;
+      setActiveProfileId(nextProfileId);
+      setViewingProfileId(nextProfileId);
+      setSelectedConversationId(undefined);
+      setLobsterSearch("");
+    }
+    if (lastRuntimeScope !== runtimeScope) {
+      setLastRuntimeScope(runtimeScope);
+    }
+  }, [lastRuntimeScope, runtimeScope, settingsQuery.data?.recentProfileId, setActiveProfileId, setViewingProfileId, setSelectedConversationId]);
+
+  useEffect(() => {
     const current = settingsQuery.data;
     if (!current || autoDetectionAttempted) {
       return;
@@ -251,12 +308,7 @@ export default function App() {
     void detectQuery.refetch()
       .then((result) => {
         const candidates = result.data ?? [];
-        const preferredRuntime = current.runtimeTarget.kind;
-        const preferred =
-          candidates.find((item) => item.runtimeKind === preferredRuntime && item.validation.isValid) ||
-          candidates.find((item) => item.runtimeKind === preferredRuntime) ||
-          candidates.find((item) => item.validation.isValid) ||
-          candidates[0];
+        const preferred = pickDetectedCandidateForRuntime(candidates, current.runtimeTarget.kind);
 
         if (preferred) {
           onApplyDetection(preferred, current);
@@ -266,6 +318,10 @@ export default function App() {
   }, [autoDetectionAttempted, detectQuery, settingsQuery.data]);
 
   useEffect(() => {
+    if (!IS_TAURI) {
+      setUpdateState({ kind: "unavailable" });
+      return;
+    }
     let cancelled = false;
     void check()
       .then((update) => {
@@ -285,9 +341,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!store.activeProfileId) store.setActiveProfileId(settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID);
-    if (!store.viewingProfileId) store.setViewingProfileId(settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID);
-  }, [settingsQuery.data?.recentProfileId, store]);
+    if (!activeProfileId) setActiveProfileId(settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID);
+    if (!viewingProfileId) setViewingProfileId(settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID);
+  }, [activeProfileId, viewingProfileId, settingsQuery.data?.recentProfileId, setActiveProfileId, setViewingProfileId]);
 
   useEffect(() => {
     if (desktopPathQuery.data && exportState.open && !exportState.exportDir) {
@@ -296,15 +352,18 @@ export default function App() {
   }, [desktopPathQuery.data, exportState.exportDir, exportState.open]);
 
   useEffect(() => {
+    if (!IS_TAURI) {
+      return;
+    }
     let offA = () => {};
     let offB = () => {};
     let offC = () => {};
     let offD = () => {};
     void listen<ChatDeltaEvent>("chat://delta", (event) => {
-      store.appendStreamingChunk(event.payload.conversationId, event.payload.content);
+      appendStreamingChunk(event.payload.conversationId, event.payload.content);
     }).then((fn) => (offA = fn));
     void listen<ChatDoneEvent>("chat://done", async (event) => {
-      store.clearStreamingConversation(event.payload.conversationId);
+      clearStreamingConversation(event.payload.conversationId);
       queryClient.setQueryData(["conversation", event.payload.conversationId], event.payload.conversation);
       queryClient.setQueryData<ConversationSummary[]>(["conversation-summaries"], (current = []) =>
         mergeConversationSummary(current, event.payload.conversation)
@@ -322,7 +381,7 @@ export default function App() {
     }).then((fn) => (offD = fn));
     void listen<ChatErrorEvent>("chat://error", (event) => {
       setStatus({ message: event.payload.error, tone: "error" });
-      store.clearStreamingConversation(event.payload.conversationId);
+      clearStreamingConversation(event.payload.conversationId);
     }).then((fn) => (offC = fn));
     return () => {
       offA();
@@ -330,37 +389,40 @@ export default function App() {
       offC();
       offD();
     };
-  }, [queryClient, store]);
+  }, [appendStreamingChunk, clearStreamingConversation, queryClient]);
 
   const profiles = profilesQuery.data ?? [];
   useEffect(() => {
     if (!profilesQuery.isFetched) {
       return;
     }
-    if (store.activeProfileId && store.activeProfileId !== LOCAL_PROFILE_ID && !profiles.some((profile) => profile.id === store.activeProfileId)) {
-      store.setActiveProfileId(LOCAL_PROFILE_ID);
+    if (activeProfileId && activeProfileId !== LOCAL_PROFILE_ID && !profiles.some((profile) => profile.id === activeProfileId)) {
+      setActiveProfileId(LOCAL_PROFILE_ID);
     }
-    if (store.viewingProfileId && store.viewingProfileId !== LOCAL_PROFILE_ID && !profiles.some((profile) => profile.id === store.viewingProfileId)) {
-      store.setViewingProfileId(LOCAL_PROFILE_ID);
+    if (viewingProfileId && viewingProfileId !== LOCAL_PROFILE_ID && !profiles.some((profile) => profile.id === viewingProfileId)) {
+      setViewingProfileId(LOCAL_PROFILE_ID);
     }
-  }, [profiles, profilesQuery.isFetched, store, store.activeProfileId, store.viewingProfileId]);
+  }, [activeProfileId, viewingProfileId, profiles, profilesQuery.isFetched, setActiveProfileId, setViewingProfileId]);
   const filteredProfiles = useMemo(() => {
     const keyword = lobsterSearch.trim().toLowerCase();
     if (!keyword) return profiles;
     return profiles.filter((profile) => `${profile.name} ${profile.path}`.toLowerCase().includes(keyword));
   }, [lobsterSearch, profiles]);
 
-  const activeLobsterId = store.activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID;
-  const viewingLobsterId = store.viewingProfileId || activeLobsterId;
+  const activeLobsterId = activeProfileId || settingsQuery.data?.recentProfileId || LOCAL_PROFILE_ID;
+  const viewingLobsterId = viewingProfileId || activeLobsterId;
   const activeLaunchRecord = (settingsQuery.data?.recentLaunches ?? []).find((launch) => launch.profileId === activeLobsterId);
   const activeLobster = profiles.find((profile) => profile.id === activeLobsterId);
   const viewingLobster = profiles.find((profile) => profile.id === viewingLobsterId);
   const activeLobsterName = activeLobster?.name ?? translateBackendText(activeLaunchRecord?.profileName) ?? t("defaultLocalLobster");
+  const currentLocalLobsterDir = settingsDraft.runtimeTarget.kind === "wsl"
+    ? settingsDraft.runtimeTarget.wslDataDir || DEFAULT_OPENCLAW_PATH
+    : settingsDraft.openclawDataDir || DEFAULT_OPENCLAW_PATH;
   const notificationsQuery = useQuery({
-    queryKey: ["notifications", activeLobsterId],
+    queryKey: ["notifications", runtimeScope, activeLobsterId],
     queryFn: () => api.listNotifications(activeLobsterId),
-    enabled: store.page === "notifications",
-    refetchInterval: store.page === "notifications" ? 5000 : false,
+    enabled: page === "notifications",
+    refetchInterval: page === "notifications" ? 5000 : false,
     refetchOnWindowFocus: false,
     staleTime: 15000
   });
@@ -395,11 +457,11 @@ export default function App() {
     () => [...chatConversations].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)),
     [chatConversations]
   );
-  const selectedConversationSummary = sortedChatConversations.find((conversation) => conversation.id === store.selectedConversationId);
+  const selectedConversationSummary = sortedChatConversations.find((conversation) => conversation.id === selectedConversationId);
   const selectedConversationQuery = useQuery({
-    queryKey: ["conversation", store.selectedConversationId],
-    queryFn: () => api.getConversation(store.selectedConversationId!),
-    enabled: store.page === "chat" && !!store.selectedConversationId,
+    queryKey: ["conversation", selectedConversationId],
+    queryFn: () => api.getConversation(selectedConversationId!),
+    enabled: page === "chat" && !!selectedConversationId,
     staleTime: 30000
   });
   const selectedConversation = selectedConversationQuery.data;
@@ -411,8 +473,8 @@ export default function App() {
   );
   useEffect(() => {
     if (chatConversations.length === 0) {
-      if (store.selectedConversationId) {
-        store.setSelectedConversationId(undefined);
+      if (selectedConversationId) {
+        setSelectedConversationId(undefined);
       }
       return;
     }
@@ -420,11 +482,11 @@ export default function App() {
       return;
     }
     const fallbackConversation = sortedChatConversations[0];
-    if (fallbackConversation && store.selectedConversationId !== fallbackConversation.id) {
-      store.setSelectedConversationId(fallbackConversation.id);
+    if (fallbackConversation && selectedConversationId !== fallbackConversation.id) {
+      setSelectedConversationId(fallbackConversation.id);
     }
-  }, [chatConversations, selectedConversationSummary, sortedChatConversations, store]);
-  const waitingForReply = store.selectedConversationId ? !!store.waitingConversations[store.selectedConversationId] : false;
+  }, [chatConversations, selectedConversationId, selectedConversationSummary, setSelectedConversationId, sortedChatConversations]);
+  const waitingForReply = selectedConversationId ? !!waitingConversations[selectedConversationId] : false;
   const needsSetup = settingsDraft.runtimeTarget.kind === "wsl"
     ? !settingsDraft.runtimeTarget.wslDistro || !settingsDraft.runtimeTarget.wslOpenclawPath || !settingsDraft.runtimeTarget.wslDataDir
     : !settingsDraft.openclawExecutablePath || !settingsDraft.openclawDataDir;
@@ -434,8 +496,13 @@ export default function App() {
     mutationFn: api.saveSettings,
     onSuccess: async (settings) => {
       setSettingsDraft(settings);
+      queryClient.setQueryData(["settings"], settings);
       setStatus({ message: t("setttingsSaved"), tone: "success" });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+      await queryClient.invalidateQueries({ queryKey: ["profile-inventory"] });
+      await queryClient.invalidateQueries({ queryKey: ["profile-readme"] });
+      await queryClient.invalidateQueries({ queryKey: ["notifications"] });
     },
     onError: (error) => setStatus({ message: readableError(error, t("saveSettingsFailed")), tone: "error" })
   });
@@ -451,8 +518,8 @@ export default function App() {
       ignoreVerification?: boolean;
     }) => api.importProfile(zipPath, requestedName, ignoreVerification),
     onSuccess: async (profile) => {
-      store.setViewingProfileId(profile.id);
-      store.setPage("profiles");
+      setViewingProfileId(profile.id);
+      setPage("profiles");
       setStatus({ message: t("importedLobsterStatus", { name: profile.name }), tone: "success" });
       await queryClient.invalidateQueries({ queryKey: ["profiles"] });
       await queryClient.invalidateQueries({ queryKey: ["profile-inventory"] });
@@ -480,12 +547,12 @@ export default function App() {
   const deleteProfileMutation = useMutation({
     mutationFn: api.deleteProfile,
     onSuccess: async (_, deletedProfileId) => {
-      if (store.activeProfileId === deletedProfileId) store.setActiveProfileId(LOCAL_PROFILE_ID);
-      if (store.viewingProfileId === deletedProfileId) store.setViewingProfileId(LOCAL_PROFILE_ID);
-      queryClient.setQueryData<Awaited<ReturnType<typeof api.listProfiles>>>(["profiles"], (current = []) =>
+      if (activeProfileId === deletedProfileId) setActiveProfileId(LOCAL_PROFILE_ID);
+      if (viewingProfileId === deletedProfileId) setViewingProfileId(LOCAL_PROFILE_ID);
+      queryClient.setQueryData<Awaited<ReturnType<typeof api.listProfiles>>>(["profiles", runtimeScope], (current = []) =>
         current.filter((profile) => profile.id !== deletedProfileId)
       );
-      queryClient.removeQueries({ queryKey: ["profile-inventory", deletedProfileId] });
+      queryClient.removeQueries({ queryKey: ["profile-inventory", runtimeScope, deletedProfileId] });
       setStatus({ message: t("deletedLobsterStatus"), tone: "success" });
       await queryClient.invalidateQueries({ queryKey: ["profiles"] });
       await queryClient.invalidateQueries({ queryKey: ["profile-inventory"] });
@@ -495,7 +562,7 @@ export default function App() {
   const renameProfileMutation = useMutation({
     mutationFn: ({ profileId, name }: { profileId: string; name: string }) => api.renameProfile(profileId, name),
     onSuccess: async (profile) => {
-      queryClient.setQueryData<Awaited<ReturnType<typeof api.listProfiles>>>(["profiles"], (current = []) =>
+      queryClient.setQueryData<Awaited<ReturnType<typeof api.listProfiles>>>(["profiles", runtimeScope], (current = []) =>
         current.map((item) => item.id === profile.id ? profile : item)
       );
       setStatus({ message: t("renamedLobsterStatus", { name: profile.name }), tone: "success" });
@@ -510,8 +577,8 @@ export default function App() {
       setLaunchingState({ profileId, startedAt: new Date().toISOString() });
     },
     onSuccess: async (handle) => {
-      store.setActiveProfileId(handle.profileId);
-      store.setViewingProfileId(handle.profileId);
+      setActiveProfileId(handle.profileId);
+      setViewingProfileId(handle.profileId);
       setLaunchingState({ profileId: handle.profileId, startedAt: handle.startedAt });
       queryClient.setQueryData<GatewayStatus>(["gateway-status"], (current) => ({
         mode: current?.mode || "manual",
@@ -550,7 +617,7 @@ export default function App() {
     onSuccess: async (preview, variables) => {
       setDocEditing(false);
       setDocDraft(preview.content);
-      queryClient.setQueryData(["profile-readme", variables.profileId], preview);
+      queryClient.setQueryData(["profile-readme", runtimeScope, variables.profileId], preview);
       setStatus({ message: t("docsSaved"), tone: "success" });
       await readmeQuery.refetch();
     },
@@ -562,7 +629,7 @@ export default function App() {
       api.sendChatMessage(conversationId, { conversationId, content, profileId }),
     onMutate: async ({ conversationId, content }) => {
       const optimistic: ChatMessage = { id: `pending-${crypto.randomUUID()}`, role: "user", content, createdAt: new Date().toISOString() };
-      store.setWaitingConversation(conversationId, true);
+      setWaitingConversation(conversationId, true);
       queryClient.setQueryData<Conversation | undefined>(["conversation", conversationId], (current) =>
         appendMessageToLoadedConversation(current, optimistic)
       );
@@ -572,7 +639,7 @@ export default function App() {
       setChatDraft("");
     },
     onError: (error, variables) => {
-      store.clearStreamingConversation(variables.conversationId);
+      clearStreamingConversation(variables.conversationId);
       setStatus({ message: readableError(error, t("sendMessageFailed")), tone: "error" });
     }
   });
@@ -606,7 +673,19 @@ export default function App() {
     saveSettingsMutation.mutate(next);
   };
 
+  const pickDetectedCandidateForRuntime = (
+    candidates: PathCandidate[],
+    runtimeKind: "windows" | "wsl"
+  ) =>
+    candidates.find((item) => item.runtimeKind === runtimeKind && item.validation.isValid) ||
+    candidates.find((item) => item.runtimeKind === runtimeKind);
+
   const onCheckForUpdates = async () => {
+    if (!IS_TAURI) {
+      setUpdateState({ kind: "unavailable" });
+      setStatus({ message: t("updaterUnavailable"), tone: "warning" });
+      return;
+    }
     setCheckingUpdates(true);
     try {
       const update = await check();
@@ -626,6 +705,11 @@ export default function App() {
   };
 
   const onInstallUpdate = async () => {
+    if (!IS_TAURI) {
+      setUpdateState({ kind: "unavailable" });
+      setStatus({ message: t("updaterUnavailable"), tone: "warning" });
+      return;
+    }
     setInstallingUpdate(true);
     try {
       const update = await check();
@@ -650,11 +734,12 @@ export default function App() {
     try {
       const result = await detectQuery.refetch();
       const candidates = result.data ?? [];
-      if (candidates.length === 0) {
+      const picked = pickDetectedCandidateForRuntime(candidates, settingsDraft.runtimeTarget.kind);
+      if (!picked) {
         setStatus({ message: t("noExecutableFound"), tone: "warning" });
         return;
       }
-      onApplyDetection(candidates.find((item) => item.validation.isValid) || candidates[0]);
+      onApplyDetection(picked);
     } catch (error) {
       setStatus({ message: readableError(error, t("autoDetectFailed")), tone: "error" });
     }
@@ -664,7 +749,7 @@ export default function App() {
     const now = new Date().toISOString();
     api.saveConversation({ id: buildConversationId(activeLobsterId), title: t("newConversation"), createdAt: now, updatedAt: now, messages: [] })
       .then((conversation) => {
-        store.setSelectedConversationId(conversation.id);
+        setSelectedConversationId(conversation.id);
         queryClient.setQueryData(["conversation", conversation.id], conversation);
         queryClient.setQueryData<ConversationSummary[]>(["conversation-summaries"], (current = []) =>
           mergeConversationSummary(current, conversation)
@@ -674,11 +759,11 @@ export default function App() {
   };
 
   const onSend = async () => {
-    if (!store.selectedConversationId || !chatDraft.trim()) return;
+    if (!selectedConversationId || !chatDraft.trim()) return;
     if (!await ensureLobsterStarted(activeLobsterId)) {
       return;
     }
-    sendMutation.mutate({ conversationId: store.selectedConversationId, content: chatDraft.trim(), profileId: activeLobsterId });
+    sendMutation.mutate({ conversationId: selectedConversationId, content: chatDraft.trim(), profileId: activeLobsterId });
   };
 
   const onImport = async () => {
@@ -701,7 +786,7 @@ export default function App() {
   };
 
   const onExport = async () => {
-    const sourceDir = viewingLobster?.path || settingsDraft.openclawDataDir || (await api.pickDirectory());
+    const sourceDir = viewingLobster?.path || currentLocalLobsterDir || (await api.pickDirectory());
     if (!sourceDir) return;
     setExportState({
       open: true,
@@ -838,8 +923,8 @@ export default function App() {
           <div className="brand-copy"><h1>{t("appName")}</h1><p>{t("appTagline")}</p></div>
         </div>
         <nav className="nav-list">
-          {(["overview", "profiles", "chat", "notifications", "docs", "settings"] as PageId[]).map((page) => (
-            <button key={page} className={`nav-button ${store.page === page ? "active" : ""}`} onClick={() => store.setPage(page)}>{navLabel(page)}</button>
+          {(["overview", "profiles", "chat", "notifications", "docs", "settings"] as PageId[]).map((navPage) => (
+            <button key={navPage} className={`nav-button ${page === navPage ? "active" : ""}`} onClick={() => setPage(navPage)}>{navLabel(navPage)}</button>
           ))}
         </nav>
         <section className="sidebar-card">
@@ -850,10 +935,10 @@ export default function App() {
       </aside>
 
       <main className="main-content">
-        {store.page === "overview" ? (
+        {page === "overview" ? (
           <section className="page-stack scroll-page profiles-page">
             <section className="hero-card">
-              <div className="hero-copy"><h2>{t("heroTitle")}</h2><p>{t("heroDescription", { name: activeLobsterName, path: DEFAULT_OPENCLAW_PATH.split("\\").join("\\") })}</p></div>
+              <div className="hero-copy"><h2>{t("heroTitle")}</h2><p>{t("heroDescription", { name: activeLobsterName, path: currentLocalLobsterDir.split("\\").join("\\") })}</p></div>
               <div className="hero-action">
                 <button className="button primary large" onClick={() => launchMutation.mutate(activeLobsterId)} disabled={needsSetup || activeLobsterLaunching}>{activeLobsterLaunching ? t("launching") : activeLobsterRunning ? t("launched") : t("launchLobster")}</button>
                 <button className="button ghost" onClick={() => void onOpenControlWeb(activeLobsterId)} disabled={needsSetup}>{t("openControlWeb")}</button>
@@ -888,7 +973,7 @@ export default function App() {
             </section>
           </section>
         ) : null}
-        {store.page === "profiles" ? (
+        {page === "profiles" ? (
           <section className="page-stack scroll-page">
             <section className="page-header profiles-page-header">
               <div>{t("profilesTag").trim() ? <span className="section-tag">{t("profilesTag")}</span> : null}<h2>{t("profilesTitle")}</h2><p className="muted">{t("profilesDescription")}</p></div>
@@ -900,10 +985,10 @@ export default function App() {
                   <input value={lobsterSearch} placeholder={t("searchLobsterPlaceholder")} onChange={(event) => setLobsterSearch(event.target.value)} />
                 </label>
                 <div className="profile-scroll-list">
-                  <button className={`profile-card compact ${viewingLobsterId === LOCAL_PROFILE_ID ? "active" : ""}`} onClick={() => store.setViewingProfileId(LOCAL_PROFILE_ID)}><strong>{t("defaultLocalLobster")}</strong></button>
+                  <button className={`profile-card compact ${viewingLobsterId === LOCAL_PROFILE_ID ? "active" : ""}`} onClick={() => setViewingProfileId(LOCAL_PROFILE_ID)}><strong>{t("defaultLocalLobster")}</strong></button>
                   <div className="stack">
                     {filteredProfiles.map((profile) => (
-                      <button key={profile.id} className={`profile-card compact ${viewingLobsterId === profile.id ? "active" : ""}`} onClick={() => store.setViewingProfileId(profile.id)}><strong>{profile.name}</strong></button>
+                      <button key={profile.id} className={`profile-card compact ${viewingLobsterId === profile.id ? "active" : ""}`} onClick={() => setViewingProfileId(profile.id)}><strong>{profile.name}</strong></button>
                     ))}
                   </div>
                 </div>
@@ -931,7 +1016,7 @@ export default function App() {
                 </div>
                 <div className="detail-list">
                   <DetailRow label={t("lobsterName")} value={viewingLobster?.name || t("defaultLocalLobster")} />
-                  <DetailRow label={t("lobsterDirectory")} value={viewingLobster?.path || settingsDraft.openclawDataDir || DEFAULT_OPENCLAW_PATH} />
+                  <DetailRow label={t("lobsterDirectory")} value={viewingLobster?.path || currentLocalLobsterDir} />
                   <DetailRow label={t("lobsterSource")} value={viewingLobster?.importedFrom || t("currentMachineDefaultDirectory")} />
                   <DetailRow label={t("createdAt")} value={viewingLobster ? formatTime(viewingLobster.createdAt) : t("systemDefault")} />
                   <DetailRow label={t("recentlyLaunched")} value={viewingLobster?.lastUsedAt ? formatTime(viewingLobster.lastUsedAt) : t("noRecordYet")} />
@@ -948,7 +1033,7 @@ export default function App() {
           </section>
         ) : null}
 
-        {store.page === "chat" ? (
+        {page === "chat" ? (
           <section className="page-stack scroll-page chat-page">
             <section className="page-header">
               <div><h2>{t("chattingWithLobster")}</h2><p className="muted">{t("currentlyUsing", { name: activeLobsterName })}</p></div>
@@ -959,9 +1044,9 @@ export default function App() {
                 <div className="panel-header"><h3>{t("conversationList")}</h3><button className="button ghost" onClick={() => onCreateConversation()}>{t("newConversation")}</button></div>
                 <div className="conversation-list">
                   {sortedChatConversations.map((conversation) => (
-                    <div key={conversation.id} className={`conversation-card ${store.selectedConversationId === conversation.id ? "active" : ""}`}>
-                      <button className="conversation-select" onClick={() => store.setSelectedConversationId(conversation.id)}><strong>{translateBackendText(conversation.title)}</strong><span className="muted">{formatTime(conversation.updatedAt)}</span></button>
-                      {store.selectedConversationId === conversation.id ? <div className="inline-actions"><button className="mini-button" onClick={() => {
+                    <div key={conversation.id} className={`conversation-card ${selectedConversationId === conversation.id ? "active" : ""}`}>
+                      <button className="conversation-select" onClick={() => setSelectedConversationId(conversation.id)}><strong>{translateBackendText(conversation.title)}</strong><span className="muted">{formatTime(conversation.updatedAt)}</span></button>
+                      {selectedConversationId === conversation.id ? <div className="inline-actions"><button className="mini-button" onClick={() => {
                         const nextTitle = window.prompt(t("renameConversationPrompt"), conversation.title);
                         if (!nextTitle || nextTitle === conversation.title) return;
                         api.getConversation(conversation.id)
@@ -980,7 +1065,7 @@ export default function App() {
                           })
                           .catch((error) => setStatus({ message: readableError(error, t("renameConversationFailed")), tone: "error" }));
                       }}>{t("rename")}</button><button className="mini-button danger" onClick={() => api.deleteConversation(conversation.id).then(() => {
-                        store.setSelectedConversationId(undefined);
+                        setSelectedConversationId(undefined);
                         queryClient.removeQueries({ queryKey: ["conversation", conversation.id] });
                         queryClient.setQueryData<ConversationSummary[]>(["conversation-summaries"], (current = []) =>
                           current.filter((item) => item.id !== conversation.id)
@@ -998,8 +1083,8 @@ export default function App() {
                       {sortedSelectedMessages.map((message) => (
                         <article key={message.id} className={`message ${message.role}`}><div className="message-head"><div className="message-role">{message.role === "user" ? t("me") : message.role === "assistant" ? activeLobsterName : t("system")}</div><time className="message-time">{formatChatTime(message.createdAt)}</time></div><MessageContent content={message.content} /></article>
                       ))}
-                      {store.selectedConversationId && store.streamingBuffer[store.selectedConversationId] ? <article className="message assistant"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("generating")}</time></div><MessageContent content={store.streamingBuffer[store.selectedConversationId]} /></article> : null}
-                      {store.selectedConversationId && waitingForReply && !store.streamingBuffer[store.selectedConversationId] ? <article className="message assistant loading"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("processing")}</time></div><div className="loading-reply"><span className="loading-spinner" aria-hidden="true" /><span>{t("thinkingMessage")}</span></div></article> : null}
+                      {selectedConversationId && streamingBuffer[selectedConversationId] ? <article className="message assistant"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("generating")}</time></div><MessageContent content={streamingBuffer[selectedConversationId]} /></article> : null}
+                      {selectedConversationId && waitingForReply && !streamingBuffer[selectedConversationId] ? <article className="message assistant loading"><div className="message-head"><div className="message-role">{activeLobsterName}</div><time className="message-time">{t("processing")}</time></div><div className="loading-reply"><span className="loading-spinner" aria-hidden="true" /><span>{t("thinkingMessage")}</span></div></article> : null}
                     </div>
                     <div className="composer"><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={t("composePlaceholder", { name: activeLobsterName })} /><div className="button-row"><button className="button primary" onClick={() => void onSend()}>{t("sendToName", { name: activeLobsterName })}</button></div></div>
                   </>
@@ -1008,7 +1093,7 @@ export default function App() {
             </section>
           </section>
         ) : null}
-        {store.page === "notifications" ? (
+        {page === "notifications" ? (
           <section className="page-stack">
             <section className="page-header">
               <div><h2>{t("notificationsTitle")}</h2><p className="muted">{t("notificationsDescription")}</p></div>
@@ -1039,7 +1124,7 @@ export default function App() {
             </div>
           </section>
         ) : null}
-        {store.page === "docs" ? (
+        {page === "docs" ? (
           <section className="page-stack">
             <section className="page-header">
               <div><h2>{t("docsTitle")}</h2><p className="muted">{t("docsDescription")}</p></div>
@@ -1088,11 +1173,11 @@ export default function App() {
             </div>
           </section>
         ) : null}
-        {store.page === "settings" ? (
+        {page === "settings" ? (
           <section className="settings-page">
             <section className="page-header"><div><h2>{t("settingsTitle")}</h2><p className="muted">{t("settingsDescription")}</p></div><button className="button primary" onClick={() => saveSettingsMutation.mutate(settingsDraft)}>{t("saveSettings")}</button></section>
             <section className="panel">
-              <div className="panel-header settings-header"><div><h3>{t("basicSettings")}</h3><p className="muted">{t("defaultExecutableIs", { path: DEFAULT_EXECUTABLE_PATH })}</p><p className="muted">{t("defaultDirectoryIs", { path: DEFAULT_OPENCLAW_PATH })}</p></div><button className="button secondary" onClick={() => void onDetectOpenclaw()}>{detectQuery.isFetching ? t("detecting") : t("autoDetect")}</button></div>
+              <div className="panel-header settings-header"><div><h3>{t("basicSettings")}</h3><p className="muted">{t("defaultExecutableIs", { path: DEFAULT_EXECUTABLE_PATH })}</p></div><button className="button secondary" onClick={() => void onDetectOpenclaw()}>{detectQuery.isFetching ? t("detecting") : t("autoDetect")}</button></div>
               <div className="setting-fields">
                 <label className="input-group">
                   <span>{isEnglish ? "Runtime Target" : "运行环境"}</span>

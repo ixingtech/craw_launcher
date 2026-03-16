@@ -68,6 +68,8 @@ struct SubscriberRuntime {
 struct DashboardRuntime {
     child: Option<Child>,
     profile_id: Option<String>,
+    wsl_distro: Option<String>,
+    wsl_executable_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -161,6 +163,8 @@ struct AppSettings {
     close_launched_profiles_on_exit: bool,
     gateway_config: GatewayConfig,
     recent_profile_id: Option<String>,
+    recent_profile_id_windows: Option<String>,
+    recent_profile_id_wsl: Option<String>,
     recent_launches: Vec<LaunchRecord>,
 }
 
@@ -174,6 +178,8 @@ impl Default for AppSettings {
             close_launched_profiles_on_exit: true,
             gateway_config: GatewayConfig::default(),
             recent_profile_id: None,
+            recent_profile_id_windows: None,
+            recent_profile_id_wsl: None,
             recent_launches: Vec::new(),
         }
     }
@@ -602,8 +608,16 @@ fn cleanup_runtime_children(state: &State<'_, RuntimeState>) {
         if let Some(child) = dashboard.child.as_mut() {
             stop_child_process(child);
         }
+        if let (Some(distro), Some(executable_path)) = (
+            dashboard.wsl_distro.as_deref(),
+            dashboard.wsl_executable_path.as_deref(),
+        ) {
+            stop_wsl_dashboard_process(distro, executable_path);
+        }
         dashboard.child = None;
         dashboard.profile_id = None;
+        dashboard.wsl_distro = None;
+        dashboard.wsl_executable_path = None;
     }
 
     if let Ok(mut gateway) = state.gateway.lock() {
@@ -644,6 +658,35 @@ fn normalize_runtime_kind(value: Option<&str>) -> String {
     }
 }
 
+fn current_recent_profile_id(settings: &AppSettings) -> Option<String> {
+    if normalize_runtime_kind(Some(&settings.runtime_target.kind)) == RUNTIME_KIND_WSL {
+        settings.recent_profile_id_wsl.clone()
+    } else {
+        settings.recent_profile_id_windows.clone()
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn set_current_recent_profile_id(settings: &mut AppSettings, profile_id: Option<String>) {
+    let profile_id = normalize_optional_string(profile_id);
+    if normalize_runtime_kind(Some(&settings.runtime_target.kind)) == RUNTIME_KIND_WSL {
+        settings.recent_profile_id_wsl = profile_id;
+    } else {
+        settings.recent_profile_id_windows = profile_id;
+    }
+    settings.recent_profile_id = current_recent_profile_id(settings);
+}
+
 fn linux_path_to_wsl_unc(distro: &str, path: &str) -> Option<PathBuf> {
     let normalized = path.trim().replace('\\', "/");
     if !normalized.starts_with('/') {
@@ -657,8 +700,63 @@ fn linux_path_to_wsl_unc(distro: &str, path: &str) -> Option<PathBuf> {
     Some(PathBuf::from(unc))
 }
 
+fn wsl_unc_to_linux_path(distro: &str, path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let prefix = format!("//wsl$/{}/", distro.trim());
+    let lowered = normalized.to_ascii_lowercase();
+    let lowered_prefix = prefix.to_ascii_lowercase();
+    let remainder = lowered.strip_prefix(&lowered_prefix)?;
+    if remainder.is_empty() {
+        return Some("/".to_string());
+    }
+    Some(format!("/{}", remainder.trim_start_matches('/')))
+}
+
+fn windows_path_to_wsl(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let (drive, remainder) = text.split_once(':')?;
+    let drive = drive.trim();
+    if drive.len() != 1 {
+        return None;
+    }
+    let suffix = remainder.trim_start_matches('/');
+    Some(format!("/mnt/{}/{}", drive.to_ascii_lowercase(), suffix))
+}
+
 fn bash_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn decode_command_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes.iter().any(|byte| *byte == 0) {
+        let words = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let decoded = String::from_utf16_lossy(&words);
+        return decoded.trim_matches('\u{feff}').to_string();
+    }
+
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+fn build_wsl_shell_setup(executable_path: Option<&str>) -> Vec<String> {
+    let mut segments = vec![
+        r#"if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1; fi"#.to_string(),
+        r#"if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1; fi"#.to_string(),
+        r#"if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1; fi"#.to_string(),
+        r#"export NVM_DIR="${NVM_DIR:-$HOME/.nvm}""#.to_string(),
+        r#"if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; fi"#.to_string(),
+    ];
+
+    if let Some(dir) = executable_path.and_then(linux_parent_dir) {
+        segments.push(format!(
+            r#"export PATH={}:$PATH"#,
+            bash_quote(&dir)
+        ));
+    }
+
+    segments
 }
 
 fn linux_parent_dir(path: &str) -> Option<String> {
@@ -681,6 +779,9 @@ fn build_wsl_script(
     cwd: Option<&str>,
 ) -> String {
     let mut segments = Vec::new();
+    if let Some(dir) = linux_parent_dir(executable_path) {
+        segments.push(format!(r#"export PATH={}:$PATH"#, bash_quote(&dir)));
+    }
     if let Some(dir) = cwd.filter(|value| !value.trim().is_empty()) {
         segments.push(format!("cd {}", bash_quote(dir)));
     }
@@ -703,47 +804,140 @@ fn build_wsl_script(
     segments.join(" && ")
 }
 
+fn stop_wsl_dashboard_process(distro: &str, executable_path: &str) {
+    let executable_name = Path::new(executable_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("openclaw");
+    let script = format!(
+        r#"
+PIDS="$(ps -eo pid=,args= | grep -F -- {executable_name} | grep -F -- " dashboard " | grep -F -- "--no-open" | grep -v grep | awk '{{print $1}}')"
+if [ -n "$PIDS" ]; then
+  kill $PIDS 2>/dev/null || true
+  sleep 1
+  kill -9 $PIDS 2>/dev/null || true
+fi
+"#,
+        executable_name = bash_quote(executable_name)
+    );
+    let _ = run_wsl_capture(distro, &script);
+}
+
 fn run_wsl_capture(distro: &str, script: &str) -> Option<(bool, String, String)> {
     let mut command = Command::new("wsl.exe");
     apply_windows_process_flags(&mut command);
-    let output = command
+    let mut child = command
         .arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
-        .arg("-lc")
-        .arg(script)
+        .arg("-s")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .ok()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(script.as_bytes()).ok()?;
+        stdin.write_all(b"\n").ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
     Some((
         output.status.success(),
-        String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        decode_command_output(&output.stdout).trim().to_string(),
+        decode_command_output(&output.stderr).trim().to_string(),
     ))
 }
 
-fn detect_wsl_openclaw_path(distro: &str) -> Option<String> {
-    let script = r#"
-if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1; fi
-if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1; fi
-if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1; fi
+fn build_wsl_openclaw_detection_script() -> String {
+    let mut script = build_wsl_shell_setup(None).join("\n");
+    script.push_str(
+        r#"
+check_candidate() {
+candidate="$1"
+[ -n "$candidate" ] || return 1
+[ -x "$candidate" ] || return 1
+case "$candidate" in
+  /mnt/*) return 1 ;;
+esac
+candidate_dir="$(dirname "$candidate")"
+if PATH="$candidate_dir:$PATH" "$candidate" --version >/dev/null 2>&1 || PATH="$candidate_dir:$PATH" "$candidate" --help >/dev/null 2>&1; then
+  printf %s "$candidate"
+  exit 0
+fi
+return 1
+}
+LATEST_NVM_OPENCLAW="$(find "$NVM_DIR/versions/node" -maxdepth 3 -path '*/bin/openclaw' 2>/dev/null | LC_ALL=C sort | tail -n 1)"
 for candidate in \
   "$(command -v openclaw 2>/dev/null)" \
-  "$HOME/.nvm/versions/node/$(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | tail -n 1)/bin/openclaw" \
+  "$HOME/.openclaw/bin/openclaw" \
   "$HOME/.local/bin/openclaw" \
+  "$HOME/.npm-global/bin/openclaw" \
+  "${PNPM_HOME:+$PNPM_HOME/openclaw}" \
+  "${NPM_CONFIG_PREFIX:+$NPM_CONFIG_PREFIX/bin/openclaw}" \
+  "${BUN_INSTALL:+$BUN_INSTALL/bin/openclaw}" \
+  "${VOLTA_HOME:+$VOLTA_HOME/bin/openclaw}" \
+  "${ASDF_DATA_DIR:+$ASDF_DATA_DIR/shims/openclaw}" \
+  "${NVM_DIR:+$NVM_DIR/current/bin/openclaw}" \
+  "$LATEST_NVM_OPENCLAW" \
+  "${FNM_DIR:+$FNM_DIR/current/bin/openclaw}" \
+  "${FNM_DIR:+$FNM_DIR/aliases/default/bin/openclaw}" \
   "/usr/local/bin/openclaw" \
   "/usr/bin/openclaw"
 do
-  if [ -n "$candidate" ] && [ -x "$candidate" ] && [ "${candidate#/mnt/}" = "$candidate" ]; then
-    printf %s "$candidate"
-    exit 0
-  fi
+  check_candidate "$candidate"
 done
 exit 1
-"#;
-    run_wsl_capture(distro, script)
+"#,
+    );
+    script
+}
+
+fn write_temp_wsl_script(script: &str) -> Result<String, String> {
+    let path = env::temp_dir().join(format!("openclaw-launcher-wsl-{}.sh", Uuid::new_v4()));
+    fs::write(&path, script).map_err(to_string_error)?;
+    windows_path_to_wsl(&path).ok_or_else(|| "Failed to convert WSL script path".to_string())
+}
+
+fn runtime_profiles_root(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, String> {
+    if normalize_runtime_kind(Some(&settings.runtime_target.kind)) == RUNTIME_KIND_WSL {
+        let runtime_target = resolve_runtime_target(settings)?;
+        return runtime_target
+            .file_data_dir
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| "Invalid WSL profiles root".to_string());
+    }
+    Ok(settings
+        .profiles_root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or(default_profiles_root(app)?))
+}
+
+fn launch_target_profile_envs(launch_target: &LaunchTarget) -> Vec<(String, String)> {
+    if launch_target.use_state_dir_env {
+        vec![(
+            "OPENCLAW_STATE_DIR".to_string(),
+            launch_target.runtime_profile_path.clone(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn launch_target_profile_args(launch_target: &LaunchTarget) -> Vec<String> {
+    launch_target
+        .cli_profile_name
+        .clone()
+        .map(|profile_name| vec!["--profile".to_string(), profile_name])
+        .unwrap_or_default()
+}
+
+fn detect_wsl_openclaw_path(distro: &str) -> Option<String> {
+    let script = build_wsl_openclaw_detection_script();
+    run_wsl_capture(distro, &script)
         .and_then(|(success, stdout, _)| success.then_some(stdout))
         .filter(|value| !value.trim().is_empty())
 }
@@ -772,7 +966,7 @@ fn detect_wsl_openclaw_candidates() -> Vec<PathCandidate> {
     let Ok(distro_output) = distro_output else {
         return Vec::new();
     };
-    let stdout = String::from_utf8_lossy(&distro_output.stdout).to_string();
+    let stdout = decode_command_output(&distro_output.stdout);
     let mut output = Vec::new();
     for (index, distro) in stdout
         .lines()
@@ -892,6 +1086,7 @@ fn build_runtime_openclaw_command(
             .as_ref()
             .ok_or_else(|| "Missing WSL distro".to_string())?;
         let script = build_wsl_script(&runtime_target.executable_path, args, envs, cwd);
+        let script_path = write_temp_wsl_script(&script)?;
         let mut command = Command::new("wsl.exe");
         apply_windows_process_flags(&mut command);
         command
@@ -899,8 +1094,7 @@ fn build_runtime_openclaw_command(
             .arg(distro)
             .arg("--")
             .arg("bash")
-            .arg("-lc")
-            .arg(script);
+            .arg(script_path);
         return Ok(command);
     }
 
@@ -971,8 +1165,19 @@ fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
     };
 
     settings.runtime_target.kind = normalize_runtime_kind(Some(&settings.runtime_target.kind));
+    settings.recent_profile_id = normalize_optional_string(settings.recent_profile_id);
+    settings.recent_profile_id_windows = normalize_optional_string(settings.recent_profile_id_windows);
+    settings.recent_profile_id_wsl = normalize_optional_string(settings.recent_profile_id_wsl);
 
     let mut normalized = false;
+
+    if settings.recent_profile_id_windows.is_none() && settings.recent_profile_id_wsl.is_none() {
+        let migrated_recent = settings.recent_profile_id.clone();
+        set_current_recent_profile_id(&mut settings, migrated_recent);
+        normalized = normalized || settings.recent_profile_id.is_some();
+    } else {
+        settings.recent_profile_id = current_recent_profile_id(&settings);
+    }
 
     if let Some(value) = settings.openclaw_executable_path.clone() {
         if let Some(resolved) = normalize_openclaw_command_path(Path::new(&value)) {
@@ -1022,14 +1227,44 @@ fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
 fn save_settings(app: AppHandle, settings: AppSettings) -> Result<AppSettings, String> {
     let path = settings_path(&app)?;
     let mut normalized_settings = settings;
+    let existing_settings = if path.exists() {
+        read_json::<AppSettings>(&path).ok()
+    } else {
+        None
+    };
     normalized_settings.runtime_target.kind =
         normalize_runtime_kind(Some(&normalized_settings.runtime_target.kind));
+    normalized_settings.recent_profile_id = normalize_optional_string(normalized_settings.recent_profile_id);
+    normalized_settings.recent_profile_id_windows =
+        normalize_optional_string(normalized_settings.recent_profile_id_windows);
+    normalized_settings.recent_profile_id_wsl =
+        normalize_optional_string(normalized_settings.recent_profile_id_wsl);
     normalized_settings.openclaw_executable_path = normalized_settings
         .openclaw_executable_path
         .as_ref()
         .and_then(|value| {
             normalize_openclaw_command_path(Path::new(value)).map(|path| display(&path))
         });
+    if normalized_settings.recent_profile_id_windows.is_none() {
+        normalized_settings.recent_profile_id_windows = existing_settings
+            .as_ref()
+            .and_then(|settings| settings.recent_profile_id_windows.clone());
+    }
+    if normalized_settings.recent_profile_id_wsl.is_none() {
+        normalized_settings.recent_profile_id_wsl = existing_settings
+            .as_ref()
+            .and_then(|settings| settings.recent_profile_id_wsl.clone());
+    }
+    if normalized_settings.recent_profile_id_windows.is_none()
+        && normalized_settings.recent_profile_id_wsl.is_none()
+    {
+        let migrated_recent = existing_settings
+            .as_ref()
+            .and_then(|settings| settings.recent_profile_id.clone());
+        set_current_recent_profile_id(&mut normalized_settings, migrated_recent);
+    } else {
+        normalized_settings.recent_profile_id = current_recent_profile_id(&normalized_settings);
+    }
     write_json(&path, &normalized_settings)?;
     sync_runtime_gateway_defaults(&app, &normalized_settings);
     Ok(normalized_settings)
@@ -1158,7 +1393,7 @@ fn import_profile_impl(
     normalize_managed_profile_runtime(&temp_target, &profile.id, Some(&settings))?;
     fs::rename(&temp_target, &target).map_err(to_string_error)?;
 
-    settings.recent_profile_id = Some(profile.id.clone());
+    set_current_recent_profile_id(&mut settings, Some(profile.id.clone()));
     save_settings(app.clone(), settings)?;
     Ok(profile)
 }
@@ -1231,8 +1466,8 @@ fn delete_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
     settings
         .recent_launches
         .retain(|item| item.profile_id != profile_id);
-    if settings.recent_profile_id.as_deref() == Some(profile_id.as_str()) {
-        settings.recent_profile_id = Some(LOCAL_PROFILE_ID.to_string());
+    if current_recent_profile_id(&settings).as_deref() == Some(profile_id.as_str()) {
+        set_current_recent_profile_id(&mut settings, Some(LOCAL_PROFILE_ID.to_string()));
     }
     save_settings(app, settings)?;
     Ok(())
@@ -1278,8 +1513,8 @@ fn rename_profile(
         },
     )?;
 
-    if settings.recent_profile_id.as_deref() == Some(&updated.id) {
-        settings.recent_profile_id = Some(updated.id.clone());
+    if current_recent_profile_id(&settings).as_deref() == Some(&updated.id) {
+        set_current_recent_profile_id(&mut settings, Some(updated.id.clone()));
     }
     for launch in &mut settings.recent_launches {
         if launch.profile_id == updated.id {
@@ -1579,7 +1814,7 @@ fn run_agent_streaming_chat(
     let profile_id = request
         .profile_id
         .clone()
-        .or_else(|| settings.recent_profile_id.clone())
+        .or_else(|| current_recent_profile_id(settings))
         .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
     validate_chat_runtime_for_target(&launch_target)?;
@@ -1721,7 +1956,7 @@ fn run_agent_cli_chat(
     let profile_id = request
         .profile_id
         .clone()
-        .or_else(|| settings.recent_profile_id.clone())
+        .or_else(|| current_recent_profile_id(settings))
         .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
     validate_chat_runtime_for_target(&launch_target)?;
@@ -1793,7 +2028,7 @@ fn run_agent_cli_chat_wsl(
     let profile_id = request
         .profile_id
         .clone()
-        .or_else(|| settings.recent_profile_id.clone())
+        .or_else(|| current_recent_profile_id(settings))
         .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
     validate_chat_runtime_for_target(&launch_target)?;
@@ -1801,7 +2036,8 @@ fn run_agent_cli_chat_wsl(
     let gateway_config =
         ensure_target_gateway_running_with_runtime(&runtime_state, &runtime_target, &launch_target)?;
 
-    let args = vec![
+    let mut args = launch_target_profile_args(&launch_target);
+    args.extend([
         "--no-color".to_string(),
         "agent".to_string(),
         "--session-id".to_string(),
@@ -1809,8 +2045,8 @@ fn run_agent_cli_chat_wsl(
         "--message".to_string(),
         request.content.clone(),
         "--json".to_string(),
-    ];
-    let mut envs = Vec::new();
+    ]);
+    let mut envs = launch_target_profile_envs(&launch_target);
     apply_gateway_env_values(&mut envs, &gateway_config, &launch_target.profile_path);
     let current_dir = linux_parent_dir(&runtime_target.executable_path);
     let mut command =
@@ -2469,33 +2705,28 @@ fn launch_openclaw_impl(
     }
 
     let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
-    let gateway_config = gateway_config_for_target(&executable_path, &launch_target)?;
-    let gateway_ready = health_check(&gateway_config).is_ok();
-    if !gateway_ready {
-        let background_app = app.clone();
-        let background_executable = executable_path.clone();
-        let background_target = launch_target.clone();
-        thread::spawn(move || {
-            let runtime_state = background_app.state::<RuntimeState>();
-            let _ = ensure_target_gateway_running(
-                &runtime_state,
-                &background_executable,
-                &background_target,
-            );
-        });
-    }
+    let gateway_config = ensure_target_gateway_running(&state, &executable_path, &launch_target)?;
     let started_at = now_iso();
     let _ = set_gateway_runtime_status(
         &state,
         Some(launch_target.profile_id.clone()),
         &gateway_config,
         true,
-        gateway_ready,
+        true,
         None,
         Some(started_at.clone()),
         None,
     );
-    let mut command = build_openclaw_command(&executable_path);
+    if let Ok(mut dashboard) = state.dashboard.lock() {
+        if let Some(child) = dashboard.child.as_mut() {
+            stop_child_process(child);
+        }
+        dashboard.child = None;
+        dashboard.profile_id = Some(launch_target.profile_id.clone());
+        dashboard.wsl_distro = None;
+        dashboard.wsl_executable_path = None;
+    }
+    /*
     if let Some(profile_name) = launch_target.cli_profile_name.clone() {
         command.arg("--profile").arg(&profile_name);
     } else if launch_target.use_state_dir_env {
@@ -2514,7 +2745,7 @@ fn launch_openclaw_impl(
     apply_gateway_env(&mut command, &gateway_config, &launch_target.profile_path);
 
     let child = command.spawn().map_err(to_string_error)?;
-    let child_pid = replace_dashboard_process(&state, child, &launch_target.profile_id)?;
+    let child_pid = replace_dashboard_process(&state, child, &launch_target.profile_id, None, None)?;
     let mut args = Vec::new();
     if let Some(profile_name) = launch_target.cli_profile_name.clone() {
         args.push("--profile".into());
@@ -2532,23 +2763,26 @@ fn launch_openclaw_impl(
         args,
         connection_message: None,
     };
+    */
 
-    settings.recent_profile_id = Some(launch_target.profile_id.clone());
+    set_current_recent_profile_id(&mut settings, Some(launch_target.profile_id.clone()));
     settings.gateway_config = gateway_config.clone();
     settings.recent_launches.insert(
         0,
         LaunchRecord {
             profile_id: launch_target.profile_id.clone(),
             profile_name: launch_target.profile_name.clone(),
-            launched_at: started_at,
+            launched_at: started_at.clone(),
         },
     );
     settings.recent_launches.truncate(10);
+    /*
     let connection_message = if gateway_ready {
         Some("已复用当前连接服务.".to_string())
     } else {
         Some("正在启动这只龙虾自己的连接服务。".to_string())
     };
+    */
     let saved_settings = save_settings(app.clone(), settings)?;
     let _ = ensure_gateway_subscriber(&app, &saved_settings);
 
@@ -2567,8 +2801,13 @@ fn launch_openclaw_impl(
     }
 
     Ok(LaunchHandle {
-        connection_message,
-        ..handle
+        pid: None,
+        started_at,
+        profile_id: launch_target.profile_id,
+        profile_name: launch_target.profile_name,
+        executable_path: executable,
+        args: Vec::new(),
+        connection_message: Some("Gateway ready".to_string()),
     })
 }
 
@@ -2580,44 +2819,36 @@ fn launch_openclaw_impl_wsl(
 ) -> Result<LaunchHandle, String> {
     let runtime_target = resolve_runtime_target(&settings)?;
     let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
-    let gateway_config = gateway_config_for_runtime_target(&runtime_target, &launch_target)?;
-    let gateway_ready = health_check(&gateway_config).is_ok();
-    if !gateway_ready {
-        let background_app = app.clone();
-        let background_target = launch_target.clone();
-        let background_runtime = runtime_target.clone();
-        thread::spawn(move || {
-            let runtime_state = background_app.state::<RuntimeState>();
-            let _ = ensure_target_gateway_running_with_runtime(
-                &runtime_state,
-                &background_runtime,
-                &background_target,
-            );
-        });
-    }
+    let gateway_config =
+        ensure_target_gateway_running_with_runtime(&state, &runtime_target, &launch_target)?;
     let started_at = now_iso();
     let _ = set_gateway_runtime_status(
         &state,
         Some(launch_target.profile_id.clone()),
         &gateway_config,
         true,
-        gateway_ready,
+        true,
         None,
         Some(started_at.clone()),
         None,
     );
+    if let Ok(mut dashboard) = state.dashboard.lock() {
+        if let Some(child) = dashboard.child.as_mut() {
+            stop_child_process(child);
+        }
+        if let (Some(distro), Some(executable_path)) = (
+            dashboard.wsl_distro.as_deref(),
+            dashboard.wsl_executable_path.as_deref(),
+        ) {
+            stop_wsl_dashboard_process(distro, executable_path);
+        }
+        dashboard.child = None;
+        dashboard.profile_id = Some(launch_target.profile_id.clone());
+        dashboard.wsl_distro = None;
+        dashboard.wsl_executable_path = None;
+    }
 
-    let mut envs = Vec::new();
-    apply_gateway_env_values(&mut envs, &gateway_config, &launch_target.profile_path);
-    let args = vec!["dashboard".to_string(), "--no-open".to_string()];
-    let current_dir = linux_parent_dir(&runtime_target.executable_path);
-    let mut command =
-        build_runtime_openclaw_command(&runtime_target, &args, &envs, current_dir.as_deref())?;
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let child = command.spawn().map_err(to_string_error)?;
-    let child_pid = replace_dashboard_process(&state, child, &launch_target.profile_id)?;
-
-    settings.recent_profile_id = Some(launch_target.profile_id.clone());
+    set_current_recent_profile_id(&mut settings, Some(launch_target.profile_id.clone()));
     settings.gateway_config = gateway_config;
     settings.recent_launches.insert(
         0,
@@ -2632,17 +2863,13 @@ fn launch_openclaw_impl_wsl(
     let _ = ensure_gateway_subscriber(&app, &saved_settings);
 
     Ok(LaunchHandle {
-        pid: Some(child_pid),
+        pid: None,
         started_at,
         profile_id: launch_target.profile_id,
         profile_name: launch_target.profile_name,
         executable_path: runtime_target.executable_path,
-        args,
-        connection_message: Some(if gateway_ready {
-            "Gateway reused".to_string()
-        } else {
-            "Starting WSL gateway".to_string()
-        }),
+        args: Vec::new(),
+        connection_message: Some("WSL gateway ready".to_string()),
     })
 }
 
@@ -2794,19 +3021,8 @@ fn build_lobster_terminal_launch(
     gateway_config: &GatewayConfig,
     use_tui: bool,
 ) -> (Vec<String>, Vec<(String, String)>) {
-    let mut args = Vec::new();
-    if let Some(profile_name) = launch_target.cli_profile_name.clone() {
-        args.push("--profile".to_string());
-        args.push(profile_name);
-    }
-
-    let mut envs = Vec::new();
-    if launch_target.use_state_dir_env {
-        envs.push((
-            "OPENCLAW_STATE_DIR".to_string(),
-            launch_target.runtime_profile_path.clone(),
-        ));
-    }
+    let mut args = launch_target_profile_args(launch_target);
+    let envs = launch_target_profile_envs(launch_target);
 
     if use_tui {
         args.push("tui".to_string());
@@ -3034,21 +3250,39 @@ fn set_gateway_runtime_status(
     Ok(())
 }
 
-fn replace_dashboard_child(runtime: &mut DashboardRuntime, child: Child, profile_id: String) -> u32 {
+#[allow(dead_code)]
+fn replace_dashboard_child(
+    runtime: &mut DashboardRuntime,
+    child: Child,
+    profile_id: String,
+    wsl_distro: Option<String>,
+    wsl_executable_path: Option<String>,
+) -> u32 {
     if let Some(previous) = runtime.child.as_mut() {
         stop_child_process(previous);
+    }
+    if let (Some(distro), Some(executable_path)) = (
+        runtime.wsl_distro.as_deref(),
+        runtime.wsl_executable_path.as_deref(),
+    ) {
+        stop_wsl_dashboard_process(distro, executable_path);
     }
 
     let pid = child.id();
     runtime.child = Some(child);
     runtime.profile_id = Some(profile_id);
+    runtime.wsl_distro = wsl_distro;
+    runtime.wsl_executable_path = wsl_executable_path;
     pid
 }
 
+#[allow(dead_code)]
 fn replace_dashboard_process(
     state: &State<'_, RuntimeState>,
     child: Child,
     profile_id: &str,
+    wsl_distro: Option<String>,
+    wsl_executable_path: Option<String>,
 ) -> Result<u32, String> {
     let mut runtime = state
         .dashboard
@@ -3058,6 +3292,8 @@ fn replace_dashboard_process(
         &mut runtime,
         child,
         profile_id.to_string(),
+        wsl_distro,
+        wsl_executable_path,
     ))
 }
 
@@ -4007,10 +4243,7 @@ fn ensure_gateway_subscriber(app: &AppHandle, settings: &AppSettings) -> Result<
         return Ok(());
     }
 
-    let profile_id = settings
-        .recent_profile_id
-        .clone()
-        .unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
+    let profile_id = current_recent_profile_id(settings).unwrap_or_else(|| LOCAL_PROFILE_ID.to_string());
     let launch_target = resolve_launch_target(app, settings, &profile_id)?;
     let gateway_config = gateway_config_for_target(&executable, &launch_target)?;
     let ws_module_path = match resolve_ws_module_path(&executable) {
@@ -4202,9 +4435,22 @@ fn resolve_launch_target(
         profile_id: profile.id.clone(),
         profile_name: profile.name.clone(),
         profile_path: profile.path.clone(),
-        runtime_profile_path: profile.path.clone(),
-        cli_profile_name: Some(cli_profile_name_for(&profile.name, &profile.id)),
-        use_state_dir_env: false,
+        runtime_profile_path: if runtime_target.is_wsl() {
+            let distro = runtime_target
+                .wsl_distro
+                .as_deref()
+                .ok_or_else(|| "Missing WSL distro".to_string())?;
+            wsl_unc_to_linux_path(distro, Path::new(&profile.path))
+                .ok_or_else(|| "Invalid WSL profile path".to_string())?
+        } else {
+            profile.path.clone()
+        },
+        cli_profile_name: if runtime_target.is_wsl() {
+            None
+        } else {
+            Some(cli_profile_name_for(&profile.name, &profile.id))
+        },
+        use_state_dir_env: runtime_target.is_wsl(),
         managed_profile: Some(profile),
     })
 }
@@ -4218,7 +4464,6 @@ fn resolve_profile_root(
         if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
             return Ok(resolve_runtime_target(settings)?.file_data_dir);
         }
-        return Err("WSL mode currently supports only the default craw".to_string());
     }
 
     if profile_id.is_empty() || profile_id == LOCAL_PROFILE_ID {
@@ -4349,7 +4594,15 @@ fn normalize_managed_profile_runtime(
     let config_path = profile_root.join("openclaw.json");
     if config_path.is_file() {
         let mut config = read_json::<serde_json::Value>(&config_path)?;
-        let workspace = profile_root.join("workspace").display().to_string();
+        let workspace = settings
+            .and_then(|value| {
+                if normalize_runtime_kind(Some(&value.runtime_target.kind)) != RUNTIME_KIND_WSL {
+                    return None;
+                }
+                let distro = value.runtime_target.wsl_distro.as_deref()?;
+                wsl_unc_to_linux_path(distro, &profile_root.join("workspace"))
+            })
+            .unwrap_or_else(|| profile_root.join("workspace").display().to_string());
         let gateway_port = managed_gateway_port(profile_id);
         let gateway_token = format!("launcher-{}", profile_id.replace('-', ""));
 
@@ -4541,8 +4794,9 @@ fn open_lobster_terminal_impl(app: AppHandle, profile_id: String) -> Result<(), 
         if script.trim().is_empty() {
             script = "exec bash".to_string();
         } else {
-            script.push_str("; exec bash");
+            script.push_str("\nexec bash");
         }
+        let script_path = write_temp_wsl_script(&script)?;
 
         let mut command = Command::new("cmd.exe");
         command
@@ -4554,8 +4808,7 @@ fn open_lobster_terminal_impl(app: AppHandle, profile_id: String) -> Result<(), 
             .arg(distro)
             .arg("--")
             .arg("bash")
-            .arg("-lc")
-            .arg(script)
+            .arg(script_path)
             .spawn()
             .map_err(to_string_error)?;
         return Ok(());
@@ -4865,13 +5118,22 @@ fn candidate_local_auth_roots(settings: Option<&AppSettings>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(configured) = settings
-        .and_then(|item| item.openclaw_data_dir.as_ref())
-        .map(PathBuf::from)
-        .filter(|path| looks_like_openclaw_data_dir(path))
-    {
-        seen.insert(configured.clone());
-        roots.push(configured);
+    if let Some(settings) = settings {
+        let configured = if normalize_runtime_kind(Some(&settings.runtime_target.kind)) == RUNTIME_KIND_WSL {
+            resolve_runtime_target(settings)
+                .ok()
+                .map(|target| target.file_data_dir)
+        } else {
+            settings
+                .openclaw_data_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|path| looks_like_openclaw_data_dir(path))
+        };
+        if let Some(configured) = configured {
+            seen.insert(configured.clone());
+            roots.push(configured);
+        }
     }
 
     if let Some(default_root) = default_openclaw_data_dir_path() {
@@ -5454,11 +5716,7 @@ fn migrate_legacy_profiles_if_needed(
 }
 
 fn profiles_root(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, String> {
-    Ok(settings
-        .profiles_root
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or(default_profiles_root(app)?))
+    runtime_profiles_root(app, settings)
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
@@ -6465,12 +6723,13 @@ fn localize_preview_json_times(value: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::{
         apply_gateway_defaults, build_lobster_terminal_launch, build_windows_terminal_command_line,
-        build_windows_terminal_script, cli_profile_name_for, collect_cron_items,
+        build_windows_terminal_script, build_wsl_openclaw_detection_script, build_wsl_script,
+        cli_profile_name_for, collect_cron_items,
         collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
-        replace_dashboard_child, stop_child_process,
+        decode_command_output, replace_dashboard_child, stop_child_process,
         extract_agent_cli_text, gateway_config_for_target, infer_data_dir, linux_path_to_wsl_unc,
         normalize_openclaw_command_path, normalize_runtime_kind, resolve_direct_openclaw_cli,
-        resolve_windows_terminal_command,
+        resolve_windows_terminal_command, windows_path_to_wsl, wsl_unc_to_linux_path,
         gateway_port_is_available, is_valid_openclaw_command_path, managed_gateway_port,
         localize_preview_json_times, sort_path_candidates,
         looks_like_openclaw_data_dir, merge_chat_errors, normalize_managed_profile_runtime,
@@ -6480,7 +6739,7 @@ mod tests {
         validate_chat_runtime_for_target, verify_import_package_impl, AppSettings, DashboardRuntime,
         ExportProfileRequest, GatewayConfig, LaunchTarget, PathCandidate, ValidationResult,
     };
-    use std::{env, fs, fs::File, io::Read, net::TcpListener, process::Command};
+    use std::{env, fs, fs::File, io::Read, net::TcpListener, path::PathBuf, process::Command};
     use uuid::Uuid;
     use walkdir::WalkDir;
     use zip::ZipArchive;
@@ -6880,6 +7139,38 @@ mod tests {
             vec!["--profile".to_string(), "profile-managed".to_string()]
         );
         assert!(envs.is_empty());
+    }
+
+    #[test]
+    fn lobster_terminal_launch_uses_state_dir_for_wsl_managed_profile() {
+        let (args, envs) = build_lobster_terminal_launch(
+            &LaunchTarget {
+                profile_id: "managed".into(),
+                profile_name: "Managed".into(),
+                profile_path: r"\\wsl$\Ubuntu\home\demo\.openclaw-profile-managed".into(),
+                runtime_profile_path: "/home/demo/.openclaw-profile-managed".into(),
+                cli_profile_name: None,
+                use_state_dir_env: true,
+                managed_profile: None,
+            },
+            &GatewayConfig {
+                mode: "auto".into(),
+                command: None,
+                args: Vec::new(),
+                url: "http://127.0.0.1:18789".into(),
+                health_endpoint: "/health".into(),
+            },
+            false,
+        );
+
+        assert!(args.is_empty());
+        assert_eq!(
+            envs,
+            vec![(
+                "OPENCLAW_STATE_DIR".to_string(),
+                "/home/demo/.openclaw-profile-managed".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -7622,11 +7913,12 @@ mod tests {
         let mut runtime = DashboardRuntime::default();
         let first = spawn_long_running_process();
         let first_pid = first.id();
-        replace_dashboard_child(&mut runtime, first, "first-profile".into());
+        replace_dashboard_child(&mut runtime, first, "first-profile".into(), None, None);
 
         let second = spawn_long_running_process();
         let second_pid = second.id();
-        let tracked_pid = replace_dashboard_child(&mut runtime, second, "second-profile".into());
+        let tracked_pid =
+            replace_dashboard_child(&mut runtime, second, "second-profile".into(), None, None);
 
         assert_eq!(tracked_pid, second_pid);
         assert_eq!(runtime.profile_id.as_deref(), Some("second-profile"));
@@ -7730,6 +8022,60 @@ mod tests {
             path.display().to_string(),
             r"\\wsl$\Ubuntu\home\demo\.openclaw"
         );
+    }
+
+    #[test]
+    fn windows_path_to_wsl_converts_drive_path() {
+        let path = PathBuf::from(r"C:\Users\demo\AppData\Local\Temp\script.sh");
+        assert_eq!(
+            windows_path_to_wsl(&path).as_deref(),
+            Some("/mnt/c/Users/demo/AppData/Local/Temp/script.sh")
+        );
+    }
+
+    #[test]
+    fn wsl_unc_to_linux_path_converts_unc_path() {
+        let path = PathBuf::from(r"\\wsl$\Ubuntu\home\demo\.openclaw-profile-managed");
+        assert_eq!(
+            wsl_unc_to_linux_path("Ubuntu", &path).as_deref(),
+            Some("/home/demo/.openclaw-profile-managed")
+        );
+    }
+
+    #[test]
+    fn decode_command_output_decodes_utf16le_text() {
+        let utf16 = b"U\0b\0u\0n\0t\0u\0\r\0\n\0";
+
+        assert_eq!(decode_command_output(utf16).trim(), "Ubuntu");
+    }
+
+    #[test]
+    fn build_wsl_script_prefixes_binary_dir_without_loading_shell_rc() {
+        let script = build_wsl_script(
+            "/home/demo/.nvm/versions/node/v24.14.0/bin/openclaw",
+            &["tui".into(), "--help".into()],
+            &[],
+            Some("/home/demo/.openclaw"),
+        );
+
+        assert!(script.contains(r#"export PATH='/home/demo/.nvm/versions/node/v24.14.0/bin':$PATH"#));
+        assert!(script.contains(r#"cd '/home/demo/.openclaw'"#));
+        assert!(script.contains(
+            r#"'/home/demo/.nvm/versions/node/v24.14.0/bin/openclaw' 'tui' '--help'"#
+        ));
+        assert!(!script.contains(".bashrc"));
+        assert!(!script.contains(".profile"));
+    }
+
+    #[test]
+    fn build_wsl_openclaw_detection_script_scans_native_linux_entrypoints() {
+        let script = build_wsl_openclaw_detection_script();
+
+        assert!(script.contains(r#"$HOME/.openclaw/bin/openclaw"#));
+        assert!(script.contains(r#"find "$NVM_DIR/versions/node" -maxdepth 3 -path '*/bin/openclaw'"#));
+        assert!(script.contains(r#"/mnt/*) return 1 ;;"#));
+        assert!(script.contains(r#"PATH="$candidate_dir:$PATH" "$candidate" --version"#));
+        assert!(!script.contains("&& check_candidate()"));
     }
 
     #[test]

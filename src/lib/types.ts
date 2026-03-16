@@ -53,6 +53,8 @@ export interface AppSettings {
   closeLaunchedProfilesOnExit: boolean;
   gatewayConfig: GatewayConfig;
   recentProfileId?: string | null;
+  recentProfileIdWindows?: string | null;
+  recentProfileIdWsl?: string | null;
   recentLaunches: LaunchRecord[];
 }
 
