@@ -104,7 +104,7 @@ const messages = {
     updatesTitle: "应用更新",
     updatesDescription: "可从 GitHub Release 自动检查并安装新版本。",
     clawMarketTitle: "小龙虾市场",
-    clawMarketDescription: "免费获取大类开源的整只龙虾",
+    clawMarketDescription: "免费获取大量开源的整只龙虾",
     openClawMarket: "打开市场",
     currentVersionLabel: "当前版本",
     checkForUpdates: "检查更新",
