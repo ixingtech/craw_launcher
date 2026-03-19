@@ -154,6 +154,7 @@ pub fn run() -> Result<(), String> {
                     package_name: args.package_name,
                     include_memory: Some(args.include_memory),
                     include_account_info: Some(args.include_account_info),
+                    runtime_target: None,
                 })?;
                 print_value(&package, cli.json)
             }

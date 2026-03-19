@@ -205,6 +205,7 @@ struct ExportProfileRequest {
     package_name: Option<String>,
     include_memory: Option<bool>,
     include_account_info: Option<bool>,
+    runtime_target: Option<RuntimeTargetConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2347,7 +2348,7 @@ fn infer_data_dir(executable_path: &Path) -> Option<PathBuf> {
 }
 
 fn export_profile_impl(request: ExportProfileRequest) -> Result<PackageMeta, String> {
-    let source = PathBuf::from(&request.source_dir);
+    let source = resolve_export_source_dir(&request)?;
     if !source.is_dir() {
         return Err("要导出的资料目录不存在.".into());
     }
@@ -2436,6 +2437,36 @@ fn export_profile_impl(request: ExportProfileRequest) -> Result<PackageMeta, Str
         include_memory,
         include_account_info,
     })
+}
+
+fn resolve_export_source_dir(request: &ExportProfileRequest) -> Result<PathBuf, String> {
+    let source_dir = request.source_dir.trim();
+    if source_dir.is_empty() {
+        return Err("Missing export source dir".to_string());
+    }
+
+    let runtime_kind = request
+        .runtime_target
+        .as_ref()
+        .map(|target| normalize_runtime_kind(Some(&target.kind)))
+        .unwrap_or_else(|| RUNTIME_KIND_WINDOWS.to_string());
+    if runtime_kind != RUNTIME_KIND_WSL {
+        return Ok(PathBuf::from(source_dir));
+    }
+
+    if source_dir.starts_with('/') {
+        let distro = request
+            .runtime_target
+            .as_ref()
+            .and_then(|target| target.wsl_distro.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Missing WSL distro for export".to_string())?;
+        return linux_path_to_wsl_unc(distro, source_dir)
+            .ok_or_else(|| "Invalid WSL export source dir".to_string());
+    }
+
+    Ok(PathBuf::from(source_dir))
 }
 
 fn collect_manifest_entries(
@@ -6726,7 +6757,7 @@ mod tests {
         build_windows_terminal_script, build_wsl_openclaw_detection_script, build_wsl_script,
         cli_profile_name_for, collect_cron_items,
         collect_setting_document_items, collect_skill_items, control_web_url, export_profile_impl,
-        decode_command_output, replace_dashboard_child, stop_child_process,
+        decode_command_output, replace_dashboard_child, resolve_export_source_dir, stop_child_process,
         extract_agent_cli_text, gateway_config_for_target, infer_data_dir, linux_path_to_wsl_unc,
         normalize_openclaw_command_path, normalize_runtime_kind, resolve_direct_openclaw_cli,
         resolve_windows_terminal_command, windows_path_to_wsl, wsl_unc_to_linux_path,
@@ -6737,7 +6768,8 @@ mod tests {
         preview_cron_item, preview_setting_document_item, preview_skill_item, read_json,
         reassign_managed_gateway_port, schedule_summary_from_value, should_skip_export_path,
         validate_chat_runtime_for_target, verify_import_package_impl, AppSettings, DashboardRuntime,
-        ExportProfileRequest, GatewayConfig, LaunchTarget, PathCandidate, ValidationResult,
+        ExportProfileRequest, GatewayConfig, LaunchTarget, PathCandidate, RuntimeTargetConfig,
+        ValidationResult,
     };
     use std::{env, fs, fs::File, io::Read, net::TcpListener, path::PathBuf, process::Command};
     use uuid::Uuid;
@@ -6935,6 +6967,7 @@ mod tests {
             package_name: Some("safe-export".into()),
             include_memory: Some(false),
             include_account_info: Some(false),
+            runtime_target: None,
         })
         .unwrap();
 
@@ -7235,6 +7268,7 @@ mod tests {
             package_name: Some("verify-export".into()),
             include_memory: Some(false),
             include_account_info: Some(false),
+            runtime_target: None,
         })
         .unwrap();
 
@@ -7505,6 +7539,7 @@ mod tests {
             package_name: Some("safe-export".into()),
             include_memory: Some(false),
             include_account_info: Some(false),
+            runtime_target: None,
         })
         .unwrap();
 
@@ -8040,6 +8075,26 @@ mod tests {
             wsl_unc_to_linux_path("Ubuntu", &path).as_deref(),
             Some("/home/demo/.openclaw-profile-managed")
         );
+    }
+
+    #[test]
+    fn resolve_export_source_dir_converts_linux_wsl_path() {
+        let path = resolve_export_source_dir(&ExportProfileRequest {
+            source_dir: "/home/demo/.openclaw".into(),
+            zip_path: None,
+            package_name: None,
+            include_memory: None,
+            include_account_info: None,
+            runtime_target: Some(RuntimeTargetConfig {
+                kind: "wsl".into(),
+                wsl_distro: Some("Ubuntu".into()),
+                wsl_openclaw_path: None,
+                wsl_data_dir: None,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(path.display().to_string(), r"\\wsl$\Ubuntu\home\demo\.openclaw");
     }
 
     #[test]

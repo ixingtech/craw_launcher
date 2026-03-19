@@ -74,6 +74,7 @@ export interface ExportProfileRequest {
   packageName?: string | null;
   includeMemory?: boolean;
   includeAccountInfo?: boolean;
+  runtimeTarget?: RuntimeTargetConfig;
 }
 
 export interface ManagedProfile {
