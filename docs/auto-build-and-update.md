@@ -14,8 +14,7 @@ The repository now includes:
 - `.github/workflows/release.yml`
   - triggers on tags like `v0.1.4`
   - builds zh-CN and en-US Windows installers
-  - uploads signed assets to the private source repository release
-  - mirrors updater assets to the public updater repository release
+  - uploads signed assets and updater manifests to the current repository release
 
 ## Required GitHub Secrets
 
@@ -23,12 +22,6 @@ Set these repository secrets before using the release workflow:
 
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-- `PUBLIC_RELEASES_TOKEN`
-
-`PUBLIC_RELEASES_TOKEN` must have access to:
-
-- the private source repository `yipuwangc/claws_launcher`
-- the public updater repository `yipuwangc/claws-launcher-releases`
 
 The checked-in public key is:
 
@@ -51,22 +44,13 @@ If you want to rotate the updater signing identity:
    - `craw-launcher_<version>_windows_x64.exe`
    - `latest-zh-CN.json`
    - `latest-en-US.json`
-4. The updater assets are mirrored to `yipuwangc/claws-launcher-releases`.
-
-## Public Updater Repository
-
-The updater repository must not stay empty. Create an initial commit once, for example:
-
-1. Add a `README.md`
-2. Push the default branch
-
-After that, `release.yml` can create or update releases in the public repository.
+4. The updater manifests point back to the same repository release assets.
 
 ## Auto Update
 
 The launcher checks these endpoints:
 
-- `https://github.com/yipuwangc/claws-launcher-releases/releases/latest/download/latest-zh-CN.json`
-- `https://github.com/yipuwangc/claws-launcher-releases/releases/latest/download/latest-en-US.json`
+- `https://github.com/ixingtech/craw_launcher/releases/latest/download/latest-zh-CN.json`
+- `https://github.com/ixingtech/craw_launcher/releases/latest/download/latest-en-US.json`
 
 The zh-CN build uses the zh-CN manifest, and the en-US build uses the en-US manifest.

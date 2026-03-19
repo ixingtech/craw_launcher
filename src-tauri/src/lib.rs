@@ -560,6 +560,7 @@ pub fn run() {
             delete_profile,
             launch_openclaw,
             open_control_web,
+            open_external_url,
             open_lobster_terminal,
             start_gateway,
             stop_gateway,
@@ -1544,6 +1545,11 @@ fn open_control_web(
     state: State<'_, RuntimeState>,
 ) -> Result<(), String> {
     open_control_web_impl(app, profile_id, state)
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    open_external_url_impl(&url)
 }
 
 #[tauri::command]
@@ -3089,13 +3095,7 @@ fn open_control_web_impl(
         let gateway_config =
             ensure_target_gateway_running_with_runtime(&state, &runtime_target, &launch_target)?;
         let url = control_web_url(&gateway_config, &launch_target.profile_path);
-        let mut command = Command::new("rundll32");
-        apply_windows_process_flags(&mut command);
-        command
-            .arg("url.dll,FileProtocolHandler")
-            .arg(url)
-            .spawn()
-            .map_err(to_string_error)?;
+        open_external_url_impl(&url)?;
         return Ok(());
     }
 
@@ -3111,27 +3111,33 @@ fn open_control_web_impl(
     let launch_target = resolve_launch_target(&app, &settings, &profile_id)?;
     let gateway_config = ensure_target_gateway_running(&state, &executable_path, &launch_target)?;
     let url = control_web_url(&gateway_config, &launch_target.profile_path);
+    open_external_url_impl(&url)
+}
 
+fn open_external_url_impl(url: &str) -> Result<(), String> {
     if cfg!(target_os = "windows") {
         let mut command = Command::new("rundll32");
         apply_windows_process_flags(&mut command);
         command
             .arg("url.dll,FileProtocolHandler")
-            .arg(&url)
+            .arg(url)
             .spawn()
             .map_err(to_string_error)?;
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
-            .arg(&url)
-            .spawn()
-            .map_err(to_string_error)?;
-    } else {
-        Command::new("xdg-open")
-            .arg(&url)
-            .spawn()
-            .map_err(to_string_error)?;
+        return Ok(());
     }
 
+    if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(to_string_error)?;
+        return Ok(());
+    }
+
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map_err(to_string_error)?;
     Ok(())
 }
 

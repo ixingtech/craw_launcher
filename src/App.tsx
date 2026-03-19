@@ -28,7 +28,7 @@ import type {
 } from "./lib/types";
 
 const LOCAL_PROFILE_ID = "__local__";
-const APP_VERSION = "0.1.10";
+const APP_VERSION = "0.1.11";
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 const IS_TAURI = isTauri();
 const DEFAULT_OPENCLAW_PATH = IS_MAC ? "~/.openclaw" : `C:\\Users\\${isEnglish ? "your-name" : "你的用户名"}\\.openclaw`;
@@ -745,6 +745,14 @@ export default function App() {
     }
   };
 
+  const onOpenClawMarket = async () => {
+    try {
+      await api.openExternalUrl("https://craw.ixing.store");
+    } catch (error) {
+      setStatus({ message: readableError(error, t("openClawMarket")), tone: "error" });
+    }
+  };
+
   const onCreateConversation = () => {
     const now = new Date().toISOString();
     api.saveConversation({ id: buildConversationId(activeLobsterId), title: t("newConversation"), createdAt: now, updatedAt: now, messages: [] })
@@ -946,6 +954,12 @@ export default function App() {
                 <div className="hero-note"><div className="hero-note-row"><span>{t("lastLaunch")}</span><strong>{activeLaunchRecord ? formatTime(activeLaunchRecord.launchedAt) : recentLaunch ? formatTime(recentLaunch.launchedAt) : t("noLaunchRecordYet")}</strong></div></div>
               </div>
             </section>
+            <button className="candidate-card market-card" onClick={() => void onOpenClawMarket()}>
+              <div className="market-card-copy">
+                <h3>{t("clawMarketTitle")}</h3>
+                <p className="muted">{t("clawMarketDescription")}</p>
+              </div>
+            </button>
             <section className="panel">
               <div className="panel-header settings-header">
                 <div>
